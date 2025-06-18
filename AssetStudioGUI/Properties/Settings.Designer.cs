@@ -107,17 +107,7 @@ namespace AssetStudioGUI.Properties {
             }
         }
         
-        [global::System.Configuration.UserScopedSettingAttribute()]
-        [global::System.Diagnostics.DebuggerNonUserCodeAttribute()]
-        [global::System.Configuration.DefaultSettingValueAttribute("Png")]
-        public global::AssetStudio.ImageFormat convertType {
-            get {
-                return ((global::AssetStudio.ImageFormat)(this["convertType"]));
-            }
-            set {
-                this["convertType"] = value;
-            }
-        }
+
         
         [global::System.Configuration.UserScopedSettingAttribute()]
         [global::System.Diagnostics.DebuggerNonUserCodeAttribute()]
@@ -143,17 +133,7 @@ namespace AssetStudioGUI.Properties {
             }
         }
         
-        [global::System.Configuration.UserScopedSettingAttribute()]
-        [global::System.Diagnostics.DebuggerNonUserCodeAttribute()]
-        [global::System.Configuration.DefaultSettingValueAttribute("MonoBehaviour")]
-        public global::CubismLive2DExtractor.Live2DMotionMode l2dMotionMode {
-            get {
-                return ((global::CubismLive2DExtractor.Live2DMotionMode)(this["l2dMotionMode"]));
-            }
-            set {
-                this["l2dMotionMode"] = value;
-            }
-        }
+    
         
         [global::System.Configuration.UserScopedSettingAttribute()]
         [global::System.Diagnostics.DebuggerNonUserCodeAttribute()]
@@ -260,18 +240,6 @@ namespace AssetStudioGUI.Properties {
             }
             set {
                 this["guiColorTheme"] = value;
-            }
-        }
-        
-        [global::System.Configuration.UserScopedSettingAttribute()]
-        [global::System.Diagnostics.DebuggerNonUserCodeAttribute()]
-        [global::System.Configuration.DefaultSettingValueAttribute("ContainerPath")]
-        public global::CubismLive2DExtractor.Live2DModelGroupOption l2dModelGroupOption {
-            get {
-                return ((global::CubismLive2DExtractor.Live2DModelGroupOption)(this["l2dModelGroupOption"]));
-            }
-            set {
-                this["l2dModelGroupOption"] = value;
             }
         }
         

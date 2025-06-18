@@ -1,33 +1,44 @@
 ﻿using AssetStudio;
-using Newtonsoft.Json;
 using OpenTK.Graphics.OpenGL;
 using System;
+using System.Buffers;
 using System.Collections.Generic;
-using System.Diagnostics;
 using System.Drawing;
-using System.Drawing.Text;
 using System.Globalization;
 using System.IO;
 using System.Linq;
 using System.Runtime.InteropServices;
 using System.Text;
-using System.Text.RegularExpressions;
 using System.Threading;
-using System.Threading.Tasks;
 using System.Timers;
 using System.Windows.Forms;
+using AssetRipper.Assets.Collections;
+using AssetRipper.Export.Modules.Shaders.ShaderBlob;
+using AssetRipper.Export.Modules.Textures;
+using AssetRipper.Export.UnityProjects.Configuration;
+using AssetRipper.Import.Structure;
+using AssetRipper.Primitives;
+using AssetRipper.Processing;
+using AssetRipper.SourceGenerated;
+using AssetRipper.SourceGenerated.Classes.ClassID_187;
+using AssetRipper.SourceGenerated.Classes.ClassID_28;
+using AssetRipper.SourceGenerated.Classes.ClassID_329;
+using AssetRipper.SourceGenerated.Classes.ClassID_48;
+using AssetRipper.SourceGenerated.Classes.ClassID_83;
+using AssetRipper.SourceGenerated.Enums;
+using AssetRipper.SourceGenerated.Extensions;
+using AssetRipper.SourceGenerated.NativeEnums.Fmod;
+using K4os.Compression.LZ4;
 using static AssetStudioGUI.Studio;
-using Font = AssetStudio.Font;
 using Microsoft.WindowsAPICodePack.Taskbar;
-#if NET472
-using OpenTK;
-using Vector3 = OpenTK.Vector3;
-using Vector4 = OpenTK.Vector4;
-#else
+using Action = System.Action;
+using BuildTarget = AssetRipper.IO.Files.BuildTarget;
 using Vector3 = OpenTK.Mathematics.Vector3;
 using Vector4 = OpenTK.Mathematics.Vector4;
 using Matrix4 = OpenTK.Mathematics.Matrix4;
-#endif
+
+using Logger = AssetStudio.Logger;
+using ShaderType = OpenTK.Graphics.OpenGL.ShaderType;
 
 namespace AssetStudioGUI
 {
@@ -35,32 +46,15 @@ namespace AssetStudioGUI
     {
         private AssetItem lastSelectedItem;
         private AssetItem lastPreviewItem;
-        private DirectBitmap imageTexture;
         private string tempClipboard;
         private bool isDarkMode;
 
-        #region FMODControl
-        private FMOD.System system;
-        private FMOD.Sound sound;
-        private FMOD.Channel channel;
-        private FMOD.MODE loopMode = FMOD.MODE.LOOP_OFF;
-        private byte[] soundBuff;
-        private uint FMODlenms;
-        private uint FMODloopstartms;
-        private uint FMODloopendms;
-        private float FMODVolume = 0.8f;
-        #endregion
+#region TexControl
+        private static char[] textureChannelNames = ['B', 'G', 'R', 'A'];
+        private bool[] textureChannels = [true, true, true, true];
+#endregion
 
-        #region SpriteControl
-        private SpriteMaskMode spriteMaskVisibleMode = SpriteMaskMode.On;
-        #endregion
-
-        #region TexControl
-        private static char[] textureChannelNames = new[] { 'B', 'G', 'R', 'A' };
-        private bool[] textureChannels = new[] { true, true, true, true };
-        #endregion
-
-        #region GLControl
+#region GLControl
         private bool glControlLoaded;
         private int mdx, mdy;
         private bool lmdown, rmdown;
@@ -83,21 +77,17 @@ namespace AssetStudioGUI
         private int wireFrameMode;
         private int shadeMode;
         private int normalMode;
-        #endregion
+#endregion
 
         //asset list sorting
         private int sortColumn = -1;
         private bool reverseSort;
 
-#if NET6_0_OR_GREATER
-        private AlphanumComparatorFastNet alphanumComparator = new AlphanumComparatorFastNet();
-#else
-        private AlphanumComparatorFast alphanumComparator = new AlphanumComparatorFast();
-#endif
+        private AlphanumComparatorFastNet alphanumComparator = new();
 
         //asset list selection
-        private List<int> selectedIndicesPrevList = new List<int>();
-        private List<AssetItem> selectedAnimationAssetsList = new List<AssetItem>();
+        private List<int> selectedIndicesPrevList = [];
+        private List<AssetItem> selectedAnimationAssetsList = [];
 
         //asset list filter
         private System.Timers.Timer delayTimer;
@@ -105,15 +95,15 @@ namespace AssetStudioGUI
 
         //tree search
         private int nextGObject;
-        private List<TreeNode> treeSrcResults = new List<TreeNode>();
+        private List<TreeNode> treeSrcResults = [];
+        private List<ListViewItem> _visibleAssets = [];
 
         //tree selection
-        private List<TreeNode> treeNodeSelectedList = new List<TreeNode>();
+        private List<TreeNode> treeNodeSelectedList = [];
         private bool treeRecursionEnabled = true;
-        private bool isRecursionEvent = false;
+        private bool isRecursionEvent;
 
         private string openDirectoryBackup = string.Empty;
-        private string saveDirectoryBackup = string.Empty;
 
         private GUILogger logger;
 
@@ -151,7 +141,6 @@ namespace AssetStudioGUI
             listSearchFilterMode.SelectedIndex = 0;
             if (string.IsNullOrEmpty(Properties.Settings.Default.fbxSettings))
             {
-                FBXinitOptions();
             }
 
             logger = new GUILogger(StatusStripUpdate);
@@ -161,7 +150,7 @@ namespace AssetStudioGUI
             Progress.Default = new Progress<int>(SetProgressBarValue);
             Studio.StatusStripUpdate = StatusStripUpdate;
         }
-
+        
         private void AssetStudioGUIForm_DragEnter(object sender, DragEventArgs e)
         {
             if (e.Data.GetDataPresent(DataFormats.FileDrop))
@@ -170,175 +159,141 @@ namespace AssetStudioGUI
             }
         }
 
-        private async void AssetStudioGUIForm_DragDrop(object sender, DragEventArgs e)
+        private void AssetStudioGUIForm_DragDrop(object sender, DragEventArgs e)
         {
-            var paths = (string[])e.Data.GetData(DataFormats.FileDrop);
-            if (paths.Length == 0)
+            var paths = (string[])e.Data?.GetData(DataFormats.FileDrop);
+            if (paths?.Length == 0)
                 return;
 
+            LoadPath(paths);
+        }
+        
+        private void loadFile_Click(object sender, EventArgs e)
+        {
+            var openFileDialog = new OpenFileDialog { InitialDirectory = openDirectoryBackup };
+            if (openFileDialog.ShowDialog(this) != DialogResult.OK)
+                return;
+
+            LoadPath(openFileDialog.FileNames);
+        }
+
+        private void loadFolder_Click(object sender, EventArgs e)
+        {
+            var openFolderDialog = new OpenFolderDialog { InitialFolder = openDirectoryBackup };
+            if (openFolderDialog.ShowDialog(this) != DialogResult.OK)
+                return;
+
+            LoadPath(openFolderDialog.Folder);
+        }
+        
+        private void LoadPath(params IReadOnlyList<string> paths)
+        {
             ResetForm();
-            for (var i = 0; i < paths.Length; i++)
-            {
-                if (paths[i].ToLower().EndsWith(".lnk"))
-                {
-                    var targetPath = LnkReader.GetLnkTarget(paths[i]);
-                    if (!string.IsNullOrEmpty(targetPath))
-                    {
-                        paths[i] = targetPath;
-                    }
-                }
-            }
-            await Task.Run(() => assetsManager.LoadFilesAndFolders(out openDirectoryBackup, paths));
-            saveDirectoryBackup = openDirectoryBackup;
-            BuildAssetStructures();
+            var settings = new LibraryConfiguration();
+            settings.ImportSettings.DefaultVersion = UnityVersion.Parse(specifyUnityVersion.Text); 
+            var gameStructure = GameStructure.Load(paths, settings);
+            var gameData = GameData.FromGameStructure(gameStructure);
+            BuildView(gameData); 
         }
 
-        private async void loadFile_Click(object sender, EventArgs e)
+        private void extractFileToolStripMenuItem_Click(object sender, EventArgs e)
         {
-            openFileDialog1.InitialDirectory = openDirectoryBackup;
-            if (openFileDialog1.ShowDialog(this) == DialogResult.OK)
-            {
-                ResetForm();
-                await Task.Run(() => assetsManager.LoadFilesAndFolders(out openDirectoryBackup, openFileDialog1.FileNames));
-                BuildAssetStructures();
-            }
-        }
-
-        private async void loadFolder_Click(object sender, EventArgs e)
-        {
-            var openFolderDialog = new OpenFolderDialog();
-            openFolderDialog.InitialFolder = openDirectoryBackup;
-            if (openFolderDialog.ShowDialog(this) == DialogResult.OK)
-            {
-                ResetForm();
-                await Task.Run(() => assetsManager.LoadFilesAndFolders(out openDirectoryBackup, openFolderDialog.Folder));
-                BuildAssetStructures();
-            }
-        }
-
-        private void specifyUnityVersion_Close(object sender, EventArgs e)
-        {
-            if (string.IsNullOrEmpty(specifyUnityVersion.Text))
-            {
-                assetsManager.SpecifyUnityVersion = null;
+            var openFileDialog = new OpenFileDialog { InitialDirectory = openDirectoryBackup };
+            if (openFileDialog.ShowDialog(this) != DialogResult.OK)
                 return;
-            }
             
-            try
-            {
-                assetsManager.SpecifyUnityVersion = new UnityVersion(specifyUnityVersion.Text);
-            }
-            catch (Exception ex)
-            {
-                Logger.Error(ex.Message);
-            }
+            var saveFolderDialog = new OpenFolderDialog { Title = "Select the save folder" };
+            if (saveFolderDialog.ShowDialog(this) != DialogResult.OK)
+                return;
+
+            var openFileNames = openFileDialog.FileNames;
+            var saveFolder = saveFolderDialog.Folder; 
+            var extractedCount = ExtractFile(openFileNames, saveFolder);
+                
+            Logger.Info($"Finished extracting {extractedCount} files.");
         }
 
-        private async void extractFileToolStripMenuItem_Click(object sender, EventArgs e)
+        private void extractFolderToolStripMenuItem_Click(object sender, EventArgs e)
         {
-            if (openFileDialog1.ShowDialog(this) == DialogResult.OK)
-            {
-                var saveFolderDialog = new OpenFolderDialog();
-                saveFolderDialog.Title = "Select the save folder";
-                if (saveFolderDialog.ShowDialog(this) == DialogResult.OK)
-                {
-                    var fileNames = openFileDialog1.FileNames;
-                    var savePath = saveFolderDialog.Folder;
-                    var extractedCount = await Task.Run(() => ExtractFile(fileNames, savePath));
-                    Logger.Info($"Finished extracting {extractedCount} files.");
-                }
-            }
+            var openFolderDialog = new OpenFolderDialog { InitialFolder = openDirectoryBackup };
+            if (openFolderDialog.ShowDialog(this) != DialogResult.OK)
+                return;
+            
+            var saveFolderDialog = new OpenFolderDialog { Title = "Select the save folder" };
+            if (saveFolderDialog.ShowDialog(this) != DialogResult.OK)
+                return;
+
+            var openFolder = openFolderDialog.Folder;
+            var saveFolder = saveFolderDialog.Folder; 
+            var extractedCount = ExtractFile(openFolder, saveFolder);
+                
+            Logger.Info($"Finished extracting {extractedCount} files.");
         }
 
-        private async void extractFolderToolStripMenuItem_Click(object sender, EventArgs e)
-        {
-            var openFolderDialog = new OpenFolderDialog();
-            if (openFolderDialog.ShowDialog(this) == DialogResult.OK)
-            {
-                var saveFolderDialog = new OpenFolderDialog();
-                saveFolderDialog.Title = "Select the save folder";
-                if (saveFolderDialog.ShowDialog(this) == DialogResult.OK)
-                {
-                    var path = openFolderDialog.Folder;
-                    var savePath = saveFolderDialog.Folder;
-                    var extractedCount = await Task.Run(() => ExtractFolder(path, savePath));
-                    Logger.Info($"Finished extracting {extractedCount} files.");
-                }
-            }
-        }
 
-        private async void BuildAssetStructures()
+        private void BuildView(GameData gameData)
         {
-            if (assetsManager.assetsFileList.Count == 0)
+            var assetCollections = _GetAssetCollections(gameData);
+
+            if (assetCollections.Length == 0)
             {
                 Logger.Info("No Unity file can be loaded.");
                 return;
             }
 
-            var (productName, treeNodeCollection) = await Task.Run(BuildAssetData);
-            var typeMap = await Task.Run(BuildClassStructure);
-            productName = string.IsNullOrEmpty(productName) ? "no productName" : productName;
-            if (isDarkMode)
-                Progress.Reset();
-
-            var serializedFile = assetsManager.assetsFileList[0];
-            var tuanjieString = serializedFile.version.IsTuanjie ? " - Tuanjie Engine" : "";
-            Text = $"{guiTitle} - {productName} - {serializedFile.version} - {serializedFile.targetPlatformString}{tuanjieString}";
-
-            assetListView.VirtualListSize = visibleAssets.Count;
-
+            var sceneTreeRoots = BuildSceneTree(assetCollections);
+            var treeNodes = BuildTreeNodes(sceneTreeRoots); 
             sceneTreeView.BeginUpdate();
-            sceneTreeView.Nodes.AddRange(treeNodeCollection.ToArray());
+            sceneTreeView.Nodes.AddRange(treeNodes);
             sceneTreeView.EndUpdate();
-            treeNodeCollection.Clear();
-
-            classesListView.BeginUpdate();
-            foreach (var version in typeMap)
-            {
-                var versionGroup = new ListViewGroup(version.Key.FullVersion);
-                classesListView.Groups.Add(versionGroup);
-
-                foreach (var uclass in version.Value)
-                {
-                    uclass.Value.Group = versionGroup;
-                    classesListView.Items.Add(uclass.Value);
-                }
-            }
-            typeMap.Clear();
-            classesListView.EndUpdate();
-
-            var types = new SortedSet<string>();
-            types.UnionWith(exportableAssets.Select(x => x.TypeString));
-            if (Studio.l2dModelDict.Count > 0)
-            {
-                types.Add("MonoBehaviour (Live2D Model)");
-            }
-            foreach (var typeString in types)
-            {
-                var typeItem = new ToolStripMenuItem
-                {
-                    CheckOnClick = true,
-                    Name = typeString,
-                    Size = new Size(180, 22),
-                    Text = typeString
-                };
-                typeItem.Click += typeToolStripMenuItem_Click;
-                filterTypeToolStripMenuItem.DropDownItems.Add(typeItem);
-            }
-            allToolStripMenuItem.Checked = true;
-            var log = $"Finished loading {assetsManager.assetsFileList.Count} file(s) with {assetListView.Items.Count} exportable assets";
-            var unityVer = assetsManager.assetsFileList[0].version;
-            var m_ObjectsCount = unityVer > 2020 ?
-                assetsManager.assetsFileList.Sum(x => x.m_Objects.LongCount(y => y.classID != (int)ClassIDType.Shader)) :
-                assetsManager.assetsFileList.Sum(x => x.m_Objects.Count);
-            var objectsCount = assetsManager.assetsFileList.Sum(x => x.Objects.Count);
-            if (m_ObjectsCount != objectsCount)
-            {
-                log += $" and {m_ObjectsCount - objectsCount} assets failed to read";
-            }
-            Logger.Info(log);
+            
+            var assetItems = BuildAssetItems(assetCollections);
+            _visibleAssets = BuildListViewItems(assetItems);
+            assetListView.VirtualListSize = _visibleAssets.Count;
         }
 
+        private static AssetCollection[] _GetAssetCollections(GameData gameData)
+            => gameData.GameBundle.Bundles.Where(b => !b.Name.StartsWith("Generated"))
+                                          .SelectMany(b => b.Collections)
+                                          .ToArray();
+
+        private void selectAsset(object sender, ListViewItemSelectionChangedEventArgs e)
+        {
+            previewPanel.Image = Properties.Resources.preview;
+            previewPanel.SizeMode = PictureBoxSizeMode.CenterImage;
+            classTextBox.Visible = false;
+            assetInfoLabel.Visible = false;
+            assetInfoLabel.Text = string.Empty;
+            textPreviewBox.Visible = false;
+            fontPreviewBox.Visible = false;
+            FMODpanel.Visible = false;
+            glControl1.Visible = false;
+            StatusStripUpdate(string.Empty);
+
+            lastSelectedItem = (AssetItem)_visibleAssets[e.ItemIndex].Tag;
+
+            if (!e.IsSelected) 
+                return;
+            
+            switch (tabControl2.SelectedIndex)
+            {
+                case 0: //Preview
+                    if (enablePreview.Checked)
+                    {
+                        string info = PreviewAssetItem(lastSelectedItem);
+                        if (displayInfo.Checked && !string.IsNullOrEmpty(info))
+                        {
+                            assetInfoLabel.Text = info;
+                            assetInfoLabel.Visible = true;
+                        }
+                    }
+                    break;
+                case 1: //Dump
+                    DumpAsset(lastSelectedItem);
+                    break;
+            }
+        }
+        
         private void typeToolStripMenuItem_Click(object sender, EventArgs e)
         {
             var typeItem = (ToolStripMenuItem)sender;
@@ -405,48 +360,13 @@ namespace AssetStudioGUI
                 if (e.Control)
                 {
                     var need = false;
-                    if (lastSelectedItem?.Type == ClassIDType.Texture2D || lastSelectedItem?.Type == ClassIDType.Texture2DArrayImage)
-                    {
-                        switch (e.KeyCode)
-                        {
-                            case Keys.B:
-                                textureChannels[0] = !textureChannels[0];
-                                need = true;
-                                break;
-                            case Keys.G:
-                                textureChannels[1] = !textureChannels[1];
-                                need = true;
-                                break;
-                            case Keys.R:
-                                textureChannels[2] = !textureChannels[2];
-                                need = true;
-                                break;
-                            case Keys.A:
-                                textureChannels[3] = !textureChannels[3];
-                                need = true;
-                                break;
-                        }
-                    }
-                    else if (lastSelectedItem?.Type == ClassIDType.Sprite && !((Sprite)lastSelectedItem.Asset).m_RD.alphaTexture.IsNull)
-                    {
-                        switch (e.KeyCode)
-                        {
-                            case Keys.A:
-                                spriteMaskVisibleMode = spriteMaskVisibleMode == SpriteMaskMode.On ? SpriteMaskMode.Off : SpriteMaskMode.On;
-                                need = true;
-                                break;
-                            case Keys.M:
-                                spriteMaskVisibleMode = spriteMaskVisibleMode == SpriteMaskMode.MaskOnly ? SpriteMaskMode.On : SpriteMaskMode.MaskOnly;
-                                need = true;
-                                break;
-                        }
-                    }
+                    
                     if (need)
                     {
                         if (lastSelectedItem != null)
                         {
-                            PreviewAsset(lastSelectedItem);
-                            assetInfoLabel.Text = lastSelectedItem.InfoText;
+                            string info = PreviewAssetItem(lastSelectedItem);
+                            assetInfoLabel.Text = info;
                         }
                     }
                 }
@@ -488,61 +408,6 @@ namespace AssetStudioGUI
 
         private void enablePreview_Check(object sender, EventArgs e)
         {
-            if (lastSelectedItem != null)
-            {
-                switch (lastSelectedItem.Type)
-                {
-                    case ClassIDType.Texture2D:
-                    case ClassIDType.Sprite:
-                        {
-                            if (enablePreview.Checked && imageTexture != null)
-                            {
-                                previewPanel.Image = imageTexture.Bitmap;
-                            }
-                            else
-                            {
-                                previewPanel.Image = Properties.Resources.preview;
-                                previewPanel.SizeMode = PictureBoxSizeMode.CenterImage;
-                            }
-                        }
-                        break;
-                    case ClassIDType.Shader:
-                    case ClassIDType.TextAsset:
-                    case ClassIDType.MonoBehaviour:
-                        textPreviewBox.Visible = !textPreviewBox.Visible;
-                        break;
-                    case ClassIDType.Font:
-                        fontPreviewBox.Visible = !fontPreviewBox.Visible;
-                        break;
-                    case ClassIDType.AudioClip:
-                        {
-                            FMODpanel.Visible = !FMODpanel.Visible;
-
-                            if (sound.hasHandle() && channel.hasHandle())
-                            {
-                                var result = channel.isPlaying(out var playing);
-                                if (result == FMOD.RESULT.OK && playing)
-                                {
-                                    channel.stop();
-                                    FMODreset();
-                                }
-                            }
-                            else if (FMODpanel.Visible)
-                            {
-                                PreviewAsset(lastSelectedItem);
-                            }
-
-                            break;
-                        }
-
-                }
-
-            }
-            else if (lastSelectedItem != null && enablePreview.Checked)
-            {
-                PreviewAsset(lastSelectedItem);
-            }
-
             Properties.Settings.Default.enablePreview = enablePreview.Checked;
             Properties.Settings.Default.Save();
         }
@@ -570,7 +435,7 @@ namespace AssetStudioGUI
 
         private void assetListView_RetrieveVirtualItem(object sender, RetrieveVirtualItemEventArgs e)
         {
-            e.Item = visibleAssets[e.ItemIndex];
+            e.Item = _visibleAssets[e.ItemIndex]; 
         }
 
         private void tabPageSelected(object sender, TabControlEventArgs e)
@@ -767,84 +632,70 @@ namespace AssetStudioGUI
             assetListView.SelectedIndices.Clear();
             selectedIndicesPrevList.Clear();
             selectedAnimationAssetsList.Clear();
-            if (sortColumn == 4) //FullSize
+            if (sortColumn == 5) //Compressed Size Estimate
             {
-                visibleAssets.Sort((a, b) =>
+                _visibleAssets.Sort((ali, bli) =>
                 {
+                    var a = (AssetItem)ali.Tag;
+                    var b = (AssetItem)bli.Tag;
+                    var asf = a.CompressedSizeEstimate;
+                    var bsf = b.CompressedSizeEstimate;
+                    
+                    return reverseSort ? bsf.CompareTo(asf) : asf.CompareTo(bsf);
+                });
+            }
+            else if (sortColumn == 4) //FullSize
+            {
+                _visibleAssets.Sort((ali, bli) =>
+                {
+                    var a = (AssetItem)ali.Tag;
+                    var b = (AssetItem)bli.Tag;
                     var asf = a.FullSize;
                     var bsf = b.FullSize;
+                    
                     return reverseSort ? bsf.CompareTo(asf) : asf.CompareTo(bsf);
                 });
             }
             else if (sortColumn == 3) // PathID
             {
-                visibleAssets.Sort((x, y) =>
+                _visibleAssets.Sort((ali, bli) =>
                 {
-                    long pathID_X = x.m_PathID;
-                    long pathID_Y = y.m_PathID;
-                    return reverseSort ? pathID_Y.CompareTo(pathID_X) : pathID_X.CompareTo(pathID_Y);
+                    var a = (AssetItem)ali.Tag;
+                    var b = (AssetItem)bli.Tag;
+                    long pathIdX = a.PathID;
+                    long pathIdY = b.PathID;
+                    
+                    return reverseSort ? pathIdY.CompareTo(pathIdX) : pathIdX.CompareTo(pathIdY);
                 });
             }
             else if (sortColumn == 0) // Name
             {
-                visibleAssets.Sort((a, b) =>
+                _visibleAssets.Sort((a, b) =>
                 {
                     var at = a.SubItems[sortColumn].Text;
                     var bt = b.SubItems[sortColumn].Text;
-                    return reverseSort ? alphanumComparator.Compare(bt, at) : alphanumComparator.Compare(at, bt);
+                    
+                    return reverseSort 
+                        ? alphanumComparator.Compare(bt, at) 
+                        : alphanumComparator.Compare(at, bt);
                 });
             }
             else
             {
-                visibleAssets.Sort((a, b) =>
+                _visibleAssets.Sort((a, b) =>
                 {
                     var at = a.SubItems[sortColumn].Text.AsSpan();
                     var bt = b.SubItems[sortColumn].Text.AsSpan();
 
-                    return reverseSort ? bt.CompareTo(at, StringComparison.OrdinalIgnoreCase) : at.CompareTo(bt, StringComparison.OrdinalIgnoreCase);
+                    return reverseSort 
+                        ? bt.CompareTo(at, StringComparison.OrdinalIgnoreCase) 
+                        : at.CompareTo(bt, StringComparison.OrdinalIgnoreCase);
                 });
             }
             assetListView.EndUpdate();
         }
 
-        private void selectAsset(object sender, ListViewItemSelectionChangedEventArgs e)
-        {
-            previewPanel.Image = Properties.Resources.preview;
-            previewPanel.SizeMode = PictureBoxSizeMode.CenterImage;
-            classTextBox.Visible = false;
-            assetInfoLabel.Visible = false;
-            assetInfoLabel.Text = null;
-            textPreviewBox.Visible = false;
-            fontPreviewBox.Visible = false;
-            FMODpanel.Visible = false;
-            glControl1.Visible = false;
-            StatusStripUpdate("");
-
-            FMODreset();
-
-            lastSelectedItem = (AssetItem)e.Item;
-
-            if (!e.IsSelected) 
-                return;
-            
-            switch (tabControl2.SelectedIndex)
-            {
-                case 0: //Preview
-                    if (enablePreview.Checked)
-                    {
-                        PreviewAsset(lastSelectedItem);
-                        if (displayInfo.Checked && lastSelectedItem.InfoText != null)
-                        {
-                            assetInfoLabel.Text = lastSelectedItem.InfoText;
-                            assetInfoLabel.Visible = true;
-                        }
-                    }
-                    break;
-                case 1: //Dump
-                    DumpAsset(lastSelectedItem);
-                    break;
-            }
-        }
+       
 
         private void DumpAsset(AssetItem assetItem)
         {
@@ -853,14 +704,14 @@ namespace AssetStudioGUI
 
             if (useDumpTreeViewToolStripMenuItem.Checked)
             {
-                using (var jsonDoc = DumpAssetToJsonDoc(assetItem.Asset))
+                using (var jsonDoc = DumpAssetToJsonDoc(assetItem.UnityObject))
                 {
-                    dumpTreeView.LoadFromJson(jsonDoc, assetItem.Text);
+                    dumpTreeView.LoadFromJson(jsonDoc, assetItem.Name);
                 }
             }
             else
             {
-                dumpTextBox.Text = Studio.DumpAsset(assetItem.Asset);
+                dumpTextBox.Text = Studio.DumpAsset(assetItem.UnityObject);
             }
         }
 
@@ -877,7 +728,7 @@ namespace AssetStudioGUI
             if (e.IsSelected)
             {
                 classTextBox.Text = ((TypeTreeItem)classesListView.SelectedItems[0]).ToString();
-                lastSelectedItem = null;
+                lastSelectedItem = new AssetItem();
             }
         }
 
@@ -890,32 +741,25 @@ namespace AssetStudioGUI
             }
         }
 
-        private void PreviewAsset(AssetItem assetItem)
+        private string PreviewAssetItem(AssetItem assetItem)
         {
-            lastPreviewItem = assetItem;
-            if (assetItem == null)
-                return;
             try
             {
-                switch (assetItem.Type)
+                switch (assetItem.UnityObject.ClassID)
                 {
-                    case ClassIDType.Texture2D:
-                    case ClassIDType.Texture2DArrayImage:
-                        PreviewTexture2D(assetItem, assetItem.Asset as Texture2D);
+                    case (int)ClassIDType.Texture2D:
+                        return PreviewTexture2D(assetItem, assetItem.UnityObject as ITexture2D);
+                    case (int)ClassIDType.Texture2DArray:
+                        return PreviewTexture2DArray(assetItem.UnityObject as ITexture2DArray);
+                    case (int)ClassIDType.AudioClip:
+                        return PreviewAudioClip(assetItem, assetItem.UnityObject as IAudioClip);
+                    case (int)ClassIDType.Shader:
+                        PreviewShader(assetItem, assetItem.UnityObject as IShader);
                         break;
-                    case ClassIDType.Texture2DArray:
-                        PreviewTexture2DArray(assetItem, assetItem.Asset as Texture2DArray);
-                        break;
-                    case ClassIDType.AudioClip:
-                        PreviewAudioClip(assetItem, assetItem.Asset as AudioClip);
-                        break;
-                    case ClassIDType.Shader:
-                        PreviewShader(assetItem.Asset as Shader);
-                        break;
-                    case ClassIDType.TextAsset:
+                    /*case (int)ClassIDType.TextAsset:
                         PreviewTextAsset(assetItem.Asset as TextAsset);
                         break;
-                    case ClassIDType.MonoBehaviour:
+                    case (int)ClassIDType.MonoBehaviour:
                         var m_MonoBehaviour = (MonoBehaviour)assetItem.Asset;
                         if (m_MonoBehaviour.m_Script.TryGet(out var m_Script))
                         {
@@ -927,25 +771,25 @@ namespace AssetStudioGUI
                         }
                         PreviewMonoBehaviour(m_MonoBehaviour);
                         break;
-                    case ClassIDType.Font:
+                    case (int)ClassIDType.Font:
                         PreviewFont(assetItem.Asset as Font);
                         break;
-                    case ClassIDType.Mesh:
+                    case (int)ClassIDType.Mesh:
                         PreviewMesh(assetItem.Asset as Mesh);
                         break;
-                    case ClassIDType.VideoClip:
+                    case (int)ClassIDType.VideoClip:
                         PreviewVideoClip(assetItem, assetItem.Asset as VideoClip);
                         break;
-                    case ClassIDType.MovieTexture:
+                    case (int)ClassIDType.MovieTexture:
                         StatusStripUpdate("Only supported export.");
                         break;
-                    case ClassIDType.Sprite:
+                    case (int)ClassIDType.Sprite:
                         PreviewSprite(assetItem, assetItem.Asset as Sprite);
                         break;
-                    case ClassIDType.Animator:
+                    case (int)ClassIDType.Animator:
                         StatusStripUpdate("Can be exported to FBX file.");
                         break;
-                    case ClassIDType.AnimationClip:
+                    case (int)ClassIDType.AnimationClip:
                         StatusStripUpdate("Can be exported with Animator or Objects");
                         break;
                     default:
@@ -956,65 +800,64 @@ namespace AssetStudioGUI
                             textPreviewBox.Visible = true;
                         }
                         break;
+                        */
                 }
             }
             catch (Exception e)
             {
-                MessageBox.Show($"Preview {assetItem.Type}:{assetItem.Text} error\r\n{e.Message}\r\n{e.StackTrace}");
+                MessageBox.Show($@"Preview {assetItem.TypeString}:{assetItem.Name} error\r\n{e.Message}\r\n{e.StackTrace}");
             }
+            
+            return string.Empty;
         }
-
-        private void PreviewTexture2DArray(AssetItem assetItem, Texture2DArray m_Texture2DArray)
+        
+        private string PreviewTexture2D(AssetItem assetItem, ITexture2D texture2D)
         {
-            assetItem.InfoText = 
-                $"Width: {m_Texture2DArray.m_Width}\n" +
-                $"Height: {m_Texture2DArray.m_Height}\n" +
-                $"Graphics format: {m_Texture2DArray.m_Format}\n" +
-                $"Texture format: {m_Texture2DArray.m_Format.ToTextureFormat()}\n" +
-                $"Texture count: {m_Texture2DArray.m_Depth}";
-        }
-
-        private void PreviewTexture2D(AssetItem assetItem, Texture2D m_Texture2D)
-        {
-            var image = m_Texture2D.ConvertToImage(true);
-            if (image != null)
+            bool isConverted = TextureConverter.TryConvertToBitmap(texture2D, out var directBitmap);
+            if (isConverted)
             {
-                var bitmap = new DirectBitmap(image);
-                image.Dispose();
-                assetItem.InfoText = $"Width: {m_Texture2D.m_Width}\nHeight: {m_Texture2D.m_Height}\nFormat: {m_Texture2D.m_TextureFormat}";
-                switch (m_Texture2D.m_TextureSettings.m_FilterMode)
+                var sb = new StringBuilder();
+                sb.AppendLine($"Width: {texture2D.Width_C28}");
+                sb.AppendLine($"Height: {texture2D.Height_C28}");
+                sb.AppendLine($"Format: {texture2D.Format_C28E.ToString()}");
+                
+                switch (texture2D.TextureSettings_C28.FilterMode)
                 {
-                    case 0: assetItem.InfoText += "\nFilter mode: Point "; break;
-                    case 1: assetItem.InfoText += "\nFilter mode: Bilinear "; break;
-                    case 2: assetItem.InfoText += "\nFilter mode: Trilinear "; break;
+                    case 0: sb.AppendLine("Filter mode: Point"); break;
+                    case 1: sb.AppendLine("Filter mode: Bilinear"); break;
+                    case 2: sb.AppendLine("Filter mode: Trilinear"); break;
                 }
-                assetItem.InfoText += $"\nAnisotropic level: {m_Texture2D.m_TextureSettings.m_Aniso}\nMip map bias: {m_Texture2D.m_TextureSettings.m_MipBias}";
-                switch (m_Texture2D.m_TextureSettings.m_WrapMode)
+
+                sb.AppendLine($"Anisotropic level: {texture2D.TextureSettings_C28.Aniso}");
+                sb.AppendLine($"Mip map bias: {texture2D.TextureSettings_C28.MipBias}");
+                
+                switch (texture2D.TextureSettings_C28.WrapMode)
                 {
-                    case 0: assetItem.InfoText += "\nWrap mode: Repeat"; break;
-                    case 1: assetItem.InfoText += "\nWrap mode: Clamp"; break;
+                    case 0: sb.AppendLine("Wrap mode: Repeat"); break;
+                    case 1: sb.AppendLine("Wrap mode: Clamp"); break;
                 }
-                assetItem.InfoText += "\nChannels: ";
+                
+                sb.Append("Channels: ");
                 int validChannel = 0;
                 for (int i = 0; i < 4; i++)
                 {
                     if (textureChannels[i])
                     {
-                        assetItem.InfoText += textureChannelNames[i];
+                        sb.Append(textureChannelNames[i]);
                         validChannel++;
                     }
                 }
                 if (validChannel == 0)
-                    assetItem.InfoText += "None";
+                    sb.Append("None");
                 if (validChannel != 4)
                 {
-                    var bytes = bitmap.Bits;
-                    for (int i = 0; i < bitmap.Height; i++)
+                    var bytes = directBitmap.Bits;
+                    for (int i = 0; i < directBitmap.Height; i++)
                     {
-                        int offset = Math.Abs(bitmap.Stride) * i;
-                        for (int j = 0; j < bitmap.Width; j++)
+                        int offset = Math.Abs(directBitmap.Width * 4) * i;
+                        for (int j = 0; j < directBitmap.Width; j++)
                         {
-                            bytes[offset] = textureChannels[0] ? bytes[offset] : validChannel == 1 && textureChannels[3] ? byte.MaxValue : byte.MinValue;
+                            bytes[offset + 0] = textureChannels[0] ? bytes[offset + 0] : validChannel == 1 && textureChannels[3] ? byte.MaxValue : byte.MinValue;
                             bytes[offset + 1] = textureChannels[1] ? bytes[offset + 1] : validChannel == 1 && textureChannels[3] ? byte.MaxValue : byte.MinValue;
                             bytes[offset + 2] = textureChannels[2] ? bytes[offset + 2] : validChannel == 1 && textureChannels[3] ? byte.MaxValue : byte.MinValue;
                             bytes[offset + 3] = textureChannels[3] ? bytes[offset + 3] : byte.MaxValue;
@@ -1022,487 +865,642 @@ namespace AssetStudioGUI
                         }
                     }
                 }
-                var switchSwizzled = m_Texture2D.m_PlatformBlob.Length != 0;
-                assetItem.InfoText += assetItem.Asset.platform == BuildTarget.Switch ? $"\nUses texture swizzling: {switchSwizzled}" : "";
-                PreviewTexture(bitmap);
+                
+                var switchSwizzled = texture2D.PlatformBlob_C28?.Length != 0;
+                sb.Append(assetItem.UnityObject.Collection.Platform == BuildTarget.Switch 
+                    ? $"\nUses texture swizzling: {switchSwizzled}" 
+                    : string.Empty);
+                
+                PreviewTexture(directBitmap, texture2D.Format_C28);
 
                 StatusStripUpdate("'Ctrl'+'R'/'G'/'B'/'A' for Channel Toggle");
+                return sb.ToString();
             }
             else
             {
                 StatusStripUpdate("Unsupported image for preview");
+                return string.Empty;
             }
         }
-
-        private void PreviewAudioClip(AssetItem assetItem, AudioClip m_AudioClip)
+        
+        private void PreviewTexture(DirectBitmap directBitmap, int textureFormat)
         {
-            //Info
-            assetItem.InfoText = "Compression format: ";
-            if (m_AudioClip.version < 5)
+            var dataSize = directBitmap.Width * directBitmap.Height * directBitmap.PixelSize;
+            var bits = ArrayPool<byte>.Shared.Rent(dataSize);
+            // TODO: Why RGBA32 need to flip R-B
+            if (textureFormat == (int)TextureFormat.RGBA32)
             {
-                switch (m_AudioClip.m_Type)
+                for (var y = 0; y < directBitmap.Height; y++)
                 {
-                    case FMODSoundType.AAC:
-                        assetItem.InfoText += "AAC";
-                        break;
-                    case FMODSoundType.AIFF:
-                        assetItem.InfoText += "AIFF";
-                        break;
-                    case FMODSoundType.IT:
-                        assetItem.InfoText += "Impulse tracker";
-                        break;
-                    case FMODSoundType.MOD:
-                        assetItem.InfoText += "Protracker / Fasttracker MOD";
-                        break;
-                    case FMODSoundType.MPEG:
-                        assetItem.InfoText += "MP2/MP3 MPEG";
-                        break;
-                    case FMODSoundType.OGGVORBIS:
-                        assetItem.InfoText += "Ogg vorbis";
-                        break;
-                    case FMODSoundType.S3M:
-                        assetItem.InfoText += "ScreamTracker 3";
-                        break;
-                    case FMODSoundType.WAV:
-                        assetItem.InfoText += "Microsoft WAV";
-                        break;
-                    case FMODSoundType.XM:
-                        assetItem.InfoText += "FastTracker 2 XM";
-                        break;
-                    case FMODSoundType.XMA:
-                        assetItem.InfoText += "Xbox360 XMA";
-                        break;
-                    case FMODSoundType.VAG:
-                        assetItem.InfoText += "PlayStation Portable ADPCM";
-                        break;
-                    case FMODSoundType.AUDIOQUEUE:
-                        assetItem.InfoText += "iPhone";
-                        break;
-                    default:
-                        assetItem.InfoText += $"Unknown ({m_AudioClip.m_Type})";
-                        break;
+                    for (var x = 0; x < directBitmap.Width; x++)
+                    {
+                        var baseIndex = (y * directBitmap.Width + x) * directBitmap.PixelSize;
+                        bits[baseIndex + 0] = directBitmap.Bits[baseIndex + 2];
+                        bits[baseIndex + 1] = directBitmap.Bits[baseIndex + 1];
+                        bits[baseIndex + 2] = directBitmap.Bits[baseIndex + 0];
+                        bits[baseIndex + 3] = directBitmap.Bits[baseIndex + 3];
+                    }
                 }
             }
             else
             {
-                switch (m_AudioClip.m_CompressionFormat)
-                {
-                    case AudioCompressionFormat.PCM:
-                        assetItem.InfoText += "PCM";
-                        break;
-                    case AudioCompressionFormat.Vorbis:
-                        assetItem.InfoText += "Vorbis";
-                        break;
-                    case AudioCompressionFormat.ADPCM:
-                        assetItem.InfoText += "ADPCM";
-                        break;
-                    case AudioCompressionFormat.MP3:
-                        assetItem.InfoText += "MP3";
-                        break;
-                    case AudioCompressionFormat.PSMVAG:
-                        assetItem.InfoText += "PlayStation Portable ADPCM";
-                        break;
-                    case AudioCompressionFormat.HEVAG:
-                        assetItem.InfoText += "PSVita ADPCM";
-                        break;
-                    case AudioCompressionFormat.XMA:
-                        assetItem.InfoText += "Xbox360 XMA";
-                        break;
-                    case AudioCompressionFormat.AAC:
-                        assetItem.InfoText += "AAC";
-                        break;
-                    case AudioCompressionFormat.GCADPCM:
-                        assetItem.InfoText += "Nintendo 3DS/Wii DSP";
-                        break;
-                    case AudioCompressionFormat.ATRAC9:
-                        assetItem.InfoText += "PSVita ATRAC9";
-                        break;
-                    default:
-                        assetItem.InfoText += "Unknown";
-                        break;
-                }
-            }
-            soundBuff = BigArrayPool<byte>.Shared.Rent(m_AudioClip.m_AudioData.Size);
-            var dataLen = m_AudioClip.m_AudioData.GetData(soundBuff);
-            if (dataLen <= 0)
-                return;
-
-            var exinfo = new FMOD.CREATESOUNDEXINFO();
-            exinfo.cbsize = Marshal.SizeOf(exinfo);
-            exinfo.length = (uint)m_AudioClip.m_Size;
-
-            var result = system.createStream(soundBuff, FMOD.MODE.OPENMEMORY | FMOD.MODE.LOWMEM | FMOD.MODE.IGNORETAGS | FMOD.MODE.ACCURATETIME | loopMode, ref exinfo, out sound);
-            if (result != FMOD.RESULT.OK)
-            {
-                if (m_AudioClip.version < (2, 6) || m_AudioClip.version >= 5)
-                {
-                    var legacyFormat = m_AudioClip.IsLegacyConvertSupport()
-                        ? "\nLegacy audio format: Raw wav data"
-                        : "";
-                    var channels = m_AudioClip.m_Channels > 0
-                        ? $"\nChannel count: {m_AudioClip.m_Channels}"
-                        : "";
-                    var bits = m_AudioClip.version >= 5
-                        ? $"\nBit depth: {m_AudioClip.m_BitsPerSample}"
-                        : "";
-                    assetItem.InfoText +=
-                        legacyFormat +
-                        $"\nLength: {m_AudioClip.m_Length:0.0##}" +
-                        $"\nSample rate: {m_AudioClip.m_Frequency}" +
-                        channels +
-                        bits;
-                }
-                var errorMsg = result == FMOD.RESULT.ERR_VERSION
-                    ? "Unsupported version of fmod sound. Try to export raw and convert with an external tool instead."
-                    : $"Preview not available, try to export instead. {FMOD.Error.String(result)}";
-                StatusStripUpdate(errorMsg);
-                FMODreset();
-                return;
+                directBitmap.Bits.CopyTo(bits); 
             }
 
-            sound.getNumSubSounds(out var numsubsounds);
-            if (numsubsounds > 0)
-            {
-                result = sound.getSubSound(0, out var subsound);
-                if (result == FMOD.RESULT.OK)
-                {
-                    sound = subsound;
-                }
-            }
-
-            result = sound.getLength(out FMODlenms, FMOD.TIMEUNIT.MS);
-            if (ERRCHECK(result)) return;
-
-            result = sound.getLoopPoints(out FMODloopstartms, FMOD.TIMEUNIT.MS, out FMODloopendms, FMOD.TIMEUNIT.MS);
-            if (result == FMOD.RESULT.OK)
-            {
-                assetItem.InfoText += $"\nLoop Start: {(FMODloopstartms / 1000 / 60):00}:{(FMODloopstartms / 1000 % 60):00}.{(FMODloopstartms / 10 % 100):00}";
-                assetItem.InfoText += $"\nLoop End: {(FMODloopendms / 1000 / 60):00}:{(FMODloopendms / 1000 % 60):00}.{(FMODloopendms / 10 % 100):00}";
-            }
-
-            var paused = !autoPlayAudioAssetsToolStripMenuItem.Checked;
-            _ = system.getMasterChannelGroup(out var channelGroup);
-            result = system.playSound(sound, channelGroup, paused, out channel);
-            if (ERRCHECK(result)) return;
-            if (!paused) { timer.Start(); }
-
-            FMODpanel.Visible = true;
-
-            result = channel.getFrequency(out var frequency);
-            if (ERRCHECK(result)) return;
-
-            FMODinfoLabel.Text = frequency + " Hz";
-            FMODtimerLabel.Text = $"00:00.00 / {(FMODlenms / 1000 / 60):00}:{(FMODlenms / 1000 % 60):00}.{(FMODlenms / 10 % 100):00}";
+            var handle = GCHandle.Alloc(bits, GCHandleType.Pinned);
+            var bitmap = new Bitmap
+            (
+                directBitmap.Width, 
+                directBitmap.Height, 
+                directBitmap.Width * directBitmap.PixelSize,
+                System.Drawing.Imaging.PixelFormat.Format32bppArgb, 
+                handle.AddrOfPinnedObject()
+            );
+            previewPanel.Image = bitmap;
             
-            sound.getFormat(out _, out _, out var audioChannels, out _);
-            switch (audioChannels)
-            {
-                case 1:
-                    FMODaudioChannelsLabel.Text = "Mono";
-                    break;
-                case 2:
-                    FMODaudioChannelsLabel.Text = "Stereo";
-                    break;
-                default:
-                    FMODaudioChannelsLabel.Text = $"{audioChannels}-Channel";
-                    break;
-            }
-        }
-
-        private void PreviewVideoClip(AssetItem assetItem, VideoClip m_VideoClip)
-        {
-            var sb = new StringBuilder();
-            sb.AppendLine($"Width: {m_VideoClip.Width}");
-            sb.AppendLine($"Height: {m_VideoClip.Height}");
-            sb.AppendLine($"Frame rate: {m_VideoClip.m_FrameRate:.0##}");
-            sb.AppendLine($"Split alpha: {m_VideoClip.m_HasSplitAlpha}");
-            assetItem.InfoText = sb.ToString();
-            
-            StatusStripUpdate("Only supported export.");
-        }
-
-        private void PreviewShader(Shader m_Shader)
-        {
-            var str = ShaderConverter.Convert(m_Shader);
-            PreviewText(str == null ? "Serialized Shader can't be read" : str.Replace("\n", "\r\n"));
-        }
-
-        private void PreviewTextAsset(TextAsset m_TextAsset)
-        {
-            var text = Encoding.UTF8.GetString(m_TextAsset.m_Script);
-            text = text.Replace("\n", "\r\n").Replace("\0", "");
-            PreviewText(text);
-        }
-
-        private void PreviewMonoBehaviour(MonoBehaviour m_MonoBehaviour)
-        {
-            var obj = m_MonoBehaviour.ToType();
-            if (obj == null)
-            {
-                var type = MonoBehaviourToTypeTree(m_MonoBehaviour);
-                obj = m_MonoBehaviour.ToType(type);
-            }
-            var str = JsonConvert.SerializeObject(obj, Formatting.Indented);
-            PreviewText(str);
-        }
-
-        private void PreviewMoc(AssetItem assetItem, MonoBehaviour m_MonoBehaviour)
-        {
-            using (var cubismMoc = new CubismMoc(m_MonoBehaviour))
-            {
-                var sb = new StringBuilder();
-                if (Studio.l2dModelDict.TryGetValue(m_MonoBehaviour, out var model) && model != null)
-                {
-                    sb.AppendLine($"Model Name: {model.Name}");
-                }
-                sb.AppendLine($"SDK Version: {cubismMoc.VersionDescription}");
-                if (cubismMoc.Version > 0)
-                {
-                    sb.AppendLine($"Canvas Width: {cubismMoc.CanvasWidth}");
-                    sb.AppendLine($"Canvas Height: {cubismMoc.CanvasHeight}");
-                    sb.AppendLine($"Center X: {cubismMoc.CentralPosX}");
-                    sb.AppendLine($"Center Y: {cubismMoc.CentralPosY}");
-                    sb.AppendLine($"Pixel Per Unit: {cubismMoc.PixelPerUnit}");
-                    sb.AppendLine($"Parameter Count: {cubismMoc.ParamCount}");
-                    sb.AppendLine($"Part Count: {cubismMoc.PartCount}");
-                }
-                assetItem.InfoText = sb.ToString();
-            }
-            StatusStripUpdate("Can be exported as Live2D Cubism model.");
-        }
-
-        private void PreviewFont(Font m_Font)
-        {
-            if (m_Font.m_FontData != null)
-            {
-                var data = Marshal.AllocCoTaskMem(m_Font.m_FontData.Length);
-                Marshal.Copy(m_Font.m_FontData, 0, data, m_Font.m_FontData.Length);
-
-                uint cFonts = 0;
-                var re = AddFontMemResourceEx(data, (uint)m_Font.m_FontData.Length, IntPtr.Zero, ref cFonts);
-                if (re != IntPtr.Zero)
-                {
-                    using (var pfc = new PrivateFontCollection())
-                    {
-                        pfc.AddMemoryFont(data, m_Font.m_FontData.Length);
-                        Marshal.FreeCoTaskMem(data);
-                        if (pfc.Families.Length > 0)
-                        {
-                            fontPreviewBox.SelectionStart = 0;
-                            fontPreviewBox.SelectionLength = 80;
-                            fontPreviewBox.SelectionFont = new System.Drawing.Font(pfc.Families[0], 16, FontStyle.Regular);
-                            fontPreviewBox.SelectionStart = 81;
-                            fontPreviewBox.SelectionLength = 56;
-                            fontPreviewBox.SelectionFont = new System.Drawing.Font(pfc.Families[0], 12, FontStyle.Regular);
-                            fontPreviewBox.SelectionStart = 138;
-                            fontPreviewBox.SelectionLength = 56;
-                            fontPreviewBox.SelectionFont = new System.Drawing.Font(pfc.Families[0], 18, FontStyle.Regular);
-                            fontPreviewBox.SelectionStart = 195;
-                            fontPreviewBox.SelectionLength = 56;
-                            fontPreviewBox.SelectionFont = new System.Drawing.Font(pfc.Families[0], 24, FontStyle.Regular);
-                            fontPreviewBox.SelectionStart = 252;
-                            fontPreviewBox.SelectionLength = 56;
-                            fontPreviewBox.SelectionFont = new System.Drawing.Font(pfc.Families[0], 36, FontStyle.Regular);
-                            fontPreviewBox.SelectionStart = 309;
-                            fontPreviewBox.SelectionLength = 56;
-                            fontPreviewBox.SelectionFont = new System.Drawing.Font(pfc.Families[0], 48, FontStyle.Regular);
-                            fontPreviewBox.SelectionStart = 366;
-                            fontPreviewBox.SelectionLength = 56;
-                            fontPreviewBox.SelectionFont = new System.Drawing.Font(pfc.Families[0], 60, FontStyle.Regular);
-                            fontPreviewBox.SelectionStart = 423;
-                            fontPreviewBox.SelectionLength = 55;
-                            fontPreviewBox.SelectionFont = new System.Drawing.Font(pfc.Families[0], 72, FontStyle.Regular);
-                            fontPreviewBox.Visible = true;
-                        }
-                    }
-                    return;
-                }
-            }
-            StatusStripUpdate("Unsupported font for preview. Try to export.");
-        }
-
-        private void PreviewMesh(Mesh m_Mesh)
-        {
-            if (m_Mesh.m_VertexCount > 0)
-            {
-                viewMatrixData = Matrix4.CreateRotationY(-MathF.PI / 4) * Matrix4.CreateRotationX(-MathF.PI / 6);
-                #region Vertices
-                if (m_Mesh.m_Vertices == null || m_Mesh.m_Vertices.Length == 0)
-                {
-                    StatusStripUpdate("Mesh can't be previewed.");
-                    return;
-                }
-                int count = 3;
-                if (m_Mesh.m_Vertices.Length == m_Mesh.m_VertexCount * 4)
-                {
-                    count = 4;
-                }
-                vertexData = new Vector3[m_Mesh.m_VertexCount];
-                // Calculate Bounding
-                float[] min = new float[3];
-                float[] max = new float[3];
-                for (int i = 0; i < 3; i++)
-                {
-                    min[i] = m_Mesh.m_Vertices[i];
-                    max[i] = m_Mesh.m_Vertices[i];
-                }
-                for (int v = 0; v < m_Mesh.m_VertexCount; v++)
-                {
-                    for (int i = 0; i < 3; i++)
-                    {
-                        min[i] = Math.Min(min[i], m_Mesh.m_Vertices[v * count + i]);
-                        max[i] = Math.Max(max[i], m_Mesh.m_Vertices[v * count + i]);
-                    }
-                    vertexData[v] = new Vector3(
-                        m_Mesh.m_Vertices[v * count],
-                        m_Mesh.m_Vertices[v * count + 1],
-                        m_Mesh.m_Vertices[v * count + 2]);
-                }
-
-                // Calculate modelMatrix
-                Vector3 dist = Vector3.One, offset = Vector3.Zero;
-                for (int i = 0; i < 3; i++)
-                {
-                    dist[i] = max[i] - min[i];
-                    offset[i] = (max[i] + min[i]) / 2;
-                }
-                float d = Math.Max(1e-5f, dist.Length);
-                modelMatrixData = Matrix4.CreateTranslation(-offset) * Matrix4.CreateScale(2f / d);
-                #endregion
-                #region Indicies
-                indiceData = new int[m_Mesh.m_Indices.Count];
-                for (int i = 0; i < m_Mesh.m_Indices.Count; i = i + 3)
-                {
-                    indiceData[i] = (int)m_Mesh.m_Indices[i];
-                    indiceData[i + 1] = (int)m_Mesh.m_Indices[i + 1];
-                    indiceData[i + 2] = (int)m_Mesh.m_Indices[i + 2];
-                }
-                #endregion
-                #region Normals
-                if (m_Mesh.m_Normals != null && m_Mesh.m_Normals.Length > 0)
-                {
-                    if (m_Mesh.m_Normals.Length == m_Mesh.m_VertexCount * 3)
-                        count = 3;
-                    else if (m_Mesh.m_Normals.Length == m_Mesh.m_VertexCount * 4)
-                        count = 4;
-                    normalData = new Vector3[m_Mesh.m_VertexCount];
-                    for (int n = 0; n < m_Mesh.m_VertexCount; n++)
-                    {
-                        normalData[n] = new Vector3(
-                            m_Mesh.m_Normals[n * count],
-                            m_Mesh.m_Normals[n * count + 1],
-                            m_Mesh.m_Normals[n * count + 2]);
-                    }
-                }
-                else
-                    normalData = null;
-                // calculate normal by ourself
-                normal2Data = new Vector3[m_Mesh.m_VertexCount];
-                int[] normalCalculatedCount = new int[m_Mesh.m_VertexCount];
-                for (int i = 0; i < m_Mesh.m_VertexCount; i++)
-                {
-                    normal2Data[i] = Vector3.Zero;
-                    normalCalculatedCount[i] = 0;
-                }
-                for (int i = 0; i < m_Mesh.m_Indices.Count; i = i + 3)
-                {
-                    Vector3 dir1 = vertexData[indiceData[i + 1]] - vertexData[indiceData[i]];
-                    Vector3 dir2 = vertexData[indiceData[i + 2]] - vertexData[indiceData[i]];
-                    Vector3 normal = Vector3.Cross(dir1, dir2);
-                    normal.Normalize();
-                    for (int j = 0; j < 3; j++)
-                    {
-                        normal2Data[indiceData[i + j]] += normal;
-                        normalCalculatedCount[indiceData[i + j]]++;
-                    }
-                }
-                for (int i = 0; i < m_Mesh.m_VertexCount; i++)
-                {
-                    if (normalCalculatedCount[i] == 0)
-                        normal2Data[i] = new Vector3(0, 1, 0);
-                    else
-                        normal2Data[i] /= normalCalculatedCount[i];
-                }
-                #endregion
-                #region Colors
-                if (m_Mesh.m_Colors != null && m_Mesh.m_Colors.Length == m_Mesh.m_VertexCount * 3)
-                {
-                    colorData = new Vector4[m_Mesh.m_VertexCount];
-                    for (int c = 0; c < m_Mesh.m_VertexCount; c++)
-                    {
-                        colorData[c] = new Vector4(
-                            m_Mesh.m_Colors[c * 3],
-                            m_Mesh.m_Colors[c * 3 + 1],
-                            m_Mesh.m_Colors[c * 3 + 2],
-                            1.0f);
-                    }
-                }
-                else if (m_Mesh.m_Colors != null && m_Mesh.m_Colors.Length == m_Mesh.m_VertexCount * 4)
-                {
-                    colorData = new Vector4[m_Mesh.m_VertexCount];
-                    for (int c = 0; c < m_Mesh.m_VertexCount; c++)
-                    {
-                        colorData[c] = new Vector4(
-                        m_Mesh.m_Colors[c * 4],
-                        m_Mesh.m_Colors[c * 4 + 1],
-                        m_Mesh.m_Colors[c * 4 + 2],
-                        m_Mesh.m_Colors[c * 4 + 3]);
-                    }
-                }
-                else
-                {
-                    colorData = new Vector4[m_Mesh.m_VertexCount];
-                    for (int c = 0; c < m_Mesh.m_VertexCount; c++)
-                    {
-                        colorData[c] = new Vector4(0.5f, 0.5f, 0.5f, 1.0f);
-                    }
-                }
-                #endregion
-                glControl1.Visible = true;
-                CreateVAO();
-                StatusStripUpdate("Using OpenGL Version: " + GL.GetString(StringName.Version) + "\n"
-                                  + "'Mouse Left'=Rotate | 'Mouse Right'=Move | 'Mouse Wheel'=Zoom \n"
-                                  + "'Ctrl W'=Wireframe | 'Ctrl S'=Shade | 'Ctrl N'=ReNormal ");
-            }
-            else
-            {
-                StatusStripUpdate("Unable to preview this mesh");
-            }
-        }
-
-        private void PreviewSprite(AssetItem assetItem, Sprite m_Sprite)
-        {
-            var image = m_Sprite.GetImage(spriteMaskMode: spriteMaskVisibleMode);
-            if (image != null)
-            {
-                var bitmap = new DirectBitmap(image);
-                image.Dispose();
-                assetItem.InfoText = $"Width: {bitmap.Width}\nHeight: {bitmap.Height}\n";
-                PreviewTexture(bitmap);
-
-                if (!m_Sprite.m_RD.alphaTexture.IsNull)
-                {
-                    assetItem.InfoText += $"Alpha Mask: {spriteMaskVisibleMode}\n";
-                    StatusStripUpdate("'Ctrl'+'A' - Enable/Disable alpha mask usage. 'Ctrl'+'M' - Show alpha mask only.");
-                }
-            }
-            else
-            {
-                StatusStripUpdate("Unsupported sprite for preview.");
-            }
-        }
-
-        private void PreviewTexture(DirectBitmap bitmap)
-        {
-            imageTexture?.Dispose();
-            imageTexture = bitmap;
-            previewPanel.Image = imageTexture.Bitmap;
-            if (imageTexture.Width > previewPanel.Width || imageTexture.Height > previewPanel.Height)
+            if (directBitmap.Width > previewPanel.Width || directBitmap.Height > previewPanel.Height)
                 previewPanel.SizeMode = PictureBoxSizeMode.Zoom;
             else
                 previewPanel.SizeMode = PictureBoxSizeMode.CenterImage;
         }
+        
+        private string PreviewTexture2DArray(ITexture2DArray texture2DArray) 
+            => $"Width: {texture2DArray.Width}\n" +
+               $"Height: {texture2DArray.Height}\n" +
+               $"Graphics format: {texture2DArray.Format}\n" +
+               $"Texture count: {texture2DArray.Depth}";
 
+        
+        private FMOD.System system;
+        private FMOD.Sound sound;
+        private FMOD.Channel channel;
+        private FMOD.SoundGroup masterSoundGroup;
+        private FMOD.MODE loopMode = FMOD.MODE.LOOP_OFF;
+        private uint FMODlenms;
+        private uint FMODloopstartms;
+        private uint FMODloopendms;
+        private float FMODVolume = 0.8f;
+        private string PreviewAudioClip(AssetItem assetItem, IAudioClip audioClip)
+        {
+            var sb = new StringBuilder();
+
+            if (audioClip.Has_CompressionFormat())
+            {
+                sb.Append("Compression format: ");
+                switch (audioClip.CompressionFormat)
+                {
+                    case 0:
+                        sb.AppendLine("PCM");
+                        break;
+                    case 1:
+                        sb.AppendLine("Vorbis");
+                        break;
+                    case 2:
+                        sb.AppendLine("ADPCM");
+                        break;
+                    case 3:
+                        sb.AppendLine("MP3");
+                        break;
+                    case 4:
+                        sb.AppendLine("VAG");
+                        break;
+                    case 5:
+                        sb.AppendLine("HEVAG");
+                        break;
+                    case 6:
+                        sb.AppendLine("XMA");
+                        break;
+                    case 7:
+                        sb.AppendLine("AAC");
+                        break;
+                    case 8:
+                        sb.AppendLine("GCADPCM");
+                        break;
+                    case 9:
+                        sb.AppendLine("ATRAC9");
+                        break;
+                    default:
+                        sb.AppendLine("Unknown");
+                        break;
+                }
+            }
+            
+            if (audioClip.Has_Format())
+            {
+                sb.Append("Format: ");
+                switch (audioClip.GetSoundFormat())
+                {
+                    case FmodSoundFormat.None:
+                        sb.AppendLine("None");
+                        break;
+                    case FmodSoundFormat.Pcm8:
+                        sb.AppendLine("PCM 8");
+                        break;
+                    case FmodSoundFormat.Pcm16:
+                        sb.AppendLine("PCM 16");
+                        break;
+                    case FmodSoundFormat.Pcm24:
+                        sb.AppendLine("PCM 24");
+                        break;
+                    case FmodSoundFormat.Pcm32:
+                        sb.AppendLine("PCM 32");
+                        break;
+                    case FmodSoundFormat.Pcmfloat:
+                        sb.AppendLine("PCM Float");
+                        break;
+                    case FmodSoundFormat.Gcadpcm:
+                        sb.AppendLine("Nintendo 3DS/Wii DSP GCADPCM");
+                        break;
+                    case FmodSoundFormat.Imaadpcm:
+                        sb.AppendLine("IMAADPCM"); 
+                        break;
+                    case FmodSoundFormat.Vag:
+                        sb.AppendLine("PlayStation 2 / PlayStation Portable ADPCM VAG");
+                        break;
+                    case FmodSoundFormat.Hevag:
+                        sb.AppendLine("PSVita ADPCM");
+                        break;
+                    case FmodSoundFormat.Xma:
+                        sb.AppendLine("Xbox 360 XMA");
+                        break;
+                    case FmodSoundFormat.Mpeg:
+                        sb.AppendLine("MP2/MP3 MPEG");
+                        break;
+                    case FmodSoundFormat.Celt:
+                        sb.AppendLine("CELT"); 
+                        break;
+                    case FmodSoundFormat.At9:
+                        sb.AppendLine("NGP ATRAC 9");
+                        break;
+                    case FmodSoundFormat.Xwma:
+                        sb.AppendLine("Xbox 360 XWMA");
+                        break;
+                    case FmodSoundFormat.Vorbis:
+                        sb.AppendLine("OGG Vorbis"); 
+                        break;
+                    case FmodSoundFormat.Max:
+                        sb.AppendLine("Max");  
+                        break;
+                    case FmodSoundFormat.Forceint:
+                        sb.AppendLine("Force Int");   
+                        break;
+                    default:
+                        sb.AppendLine( $"Unknown ({audioClip.GetSoundFormat()})");
+                        break;
+                }
+            }
+
+            if (audioClip.Has_Type())
+            {
+                sb.Append("Type: ");
+                switch (audioClip.GetSoundType())
+                {
+                    case FmodSoundType.Unknown:
+                        sb.AppendLine("Unknown");
+                        break;
+                    case FmodSoundType.Acc:
+                        sb.AppendLine("ACC");
+                        break;
+                    case FmodSoundType.Aiff:
+                        sb.AppendLine("AIFF");
+                        break;
+                    case FmodSoundType.Asf:
+                        sb.AppendLine("ASF");
+                        break;
+                    case FmodSoundType.At3:
+                        sb.AppendLine("AT3");
+                        break;
+                    case FmodSoundType.Cdda:
+                        sb.AppendLine("CDDA");
+                        break;
+                    case FmodSoundType.Dls:
+                        sb.AppendLine("DLS");
+                        break;
+                    case FmodSoundType.Flac:
+                        sb.AppendLine("FLAC");
+                        break;
+                    case FmodSoundType.Fsb:
+                        sb.AppendLine("FSB");
+                        break;
+                    case FmodSoundType.Gcadpcm:
+                        sb.AppendLine("GCADPCM");
+                        break;
+                    case FmodSoundType.It:
+                        sb.AppendLine("IT");
+                        break;
+                    case FmodSoundType.Midi:
+                        sb.AppendLine("MIDI");
+                        break;
+                    case FmodSoundType.Mod:
+                        sb.AppendLine("MOD");
+                        break;
+                    case FmodSoundType.Mpeg:
+                        sb.AppendLine("MPEG");
+                        break;
+                    case FmodSoundType.Oggvorbis:
+                        sb.AppendLine("OGG Vorbis");
+                        break;
+                    case FmodSoundType.Playlist:
+                        sb.AppendLine("Playlist");
+                        break;
+                    case FmodSoundType.Raw:
+                        sb.AppendLine("Raw");
+                        break;
+                    case FmodSoundType.S3m:
+                        sb.AppendLine("S3M");
+                        break;
+                    case FmodSoundType.Sf2:
+                        sb.AppendLine("SF2");
+                        break;
+                    case FmodSoundType.User:
+                        sb.AppendLine("User");
+                        break;
+                    case FmodSoundType.Wav:
+                        sb.AppendLine("WAV");
+                        break;
+                    case FmodSoundType.Xm:
+                        sb.AppendLine("XM");
+                        break;
+                    case FmodSoundType.Xma:
+                        sb.AppendLine("XMA");
+                        break;
+                    case FmodSoundType.Vag:
+                        sb.AppendLine("VAG");
+                        break;
+                    case FmodSoundType.Audioqueue:
+                        sb.AppendLine("Audio Queue");
+                        break;
+                    case FmodSoundType.Xwma:
+                        sb.AppendLine("XWMA");
+                        break;
+                    case FmodSoundType.Bcwav:
+                        sb.AppendLine("BCWAV");
+                        break;
+                    case FmodSoundType.At9:
+                        sb.AppendLine("AT9");
+                        break;
+                    case FmodSoundType.Vorbis:
+                        sb.AppendLine("Vorbis");
+                        break;
+                    case FmodSoundType.MediaFoundation:
+                        sb.AppendLine("Media Foundation");
+                        break;
+                    case FmodSoundType.Max:
+                        sb.AppendLine("MAX");
+                        break;
+                    case FmodSoundType.Forceint:
+                        sb.AppendLine("Force Int");
+                        break;
+                    default:
+                        sb.AppendLine("Unknown");
+                        break;
+                }
+            }
+
+            if (audioClip.Has_Length())
+                sb.AppendLine($"Length: {audioClip.Length:0.0##}");
+            if (audioClip.Has_Channels())
+                sb.AppendLine($"Channel count: {audioClip.Channels}");
+            if(audioClip.Has_Frequency())
+                sb.AppendLine($"Sample rate: {audioClip.Frequency}");
+            if (audioClip.Has_BitsPerSample())
+                sb.AppendLine($"Bit depth: {audioClip.BitsPerSample}");
+            
+            var audioData = audioClip.GetAudioData();
+            
+            if (audioData.Length == 0)
+                return sb.ToString();
+            
+            var exinfo = new FMOD.CREATESOUNDEXINFO();
+
+            exinfo.cbsize = Marshal.SizeOf(exinfo);
+            exinfo.length = (uint)audioData.Length;
+
+            var result = system.createSound(audioData, FMOD.MODE.OPENMEMORY | loopMode, ref exinfo, out sound);
+            if (ERRCHECK(result)) return sb.ToString();
+
+            sound.getNumSubSounds(out var numsubsounds);
+
+            if (numsubsounds > 0)
+            {
+                result = sound.getSubSound(0, out var subSound);
+                if (result == FMOD.RESULT.OK)
+                {
+                    sound = subSound;
+                }
+            }
+
+            result = sound.getLength(out FMODlenms, FMOD.TIMEUNIT.MS);
+            if (ERRCHECK(result)) return sb.ToString();
+
+            result = sound.getLoopPoints(out FMODloopstartms, FMOD.TIMEUNIT.MS, out FMODloopendms, FMOD.TIMEUNIT.MS);
+            if (result == FMOD.RESULT.OK)
+            {
+                sb.AppendLine($"Loop Start: {(FMODloopstartms / 1000 / 60):00}:{(FMODloopstartms / 1000 % 60):00}.{(FMODloopstartms / 10 % 100):00}");
+                sb.AppendLine($"Loop End: {(FMODloopendms / 1000 / 60):00}:{(FMODloopendms / 1000 % 60):00}.{(FMODloopendms / 10 % 100):00}");
+            }
+            
+            _ = system.getMasterChannelGroup(out var channelGroup);
+            result = system.playSound(sound, channelGroup, true, out channel);
+            if (ERRCHECK(result)) return sb.ToString();
+
+            FMODpanel.Visible = true;
+
+            result = channel.getFrequency(out var frequency);
+            if (ERRCHECK(result)) return sb.ToString();
+
+            FMODinfoLabel.Text = frequency + " Hz";
+            FMODtimerLabel.Text = $"00:00.00 / {(FMODlenms / 1000 / 60):00}:{(FMODlenms / 1000 % 60):00}.{(FMODlenms / 10 % 100):00}";
+
+            return sb.ToString();
+        }
+        
+        private void FMODinit()
+        {
+            FMODreset();
+
+            var result = FMOD.Factory.System_Create(out system);
+            if (ERRCHECK(result)) { return; }
+
+            result = system.getVersion(out var version);
+            ERRCHECK(result);
+            if (version < FMOD.VERSION.number)
+            {
+                Logger.Error($"Error! You are using an old version of FMOD {version:X}. This program requires {FMOD.VERSION.number:X}.");
+                Application.Exit();
+            }
+
+            result = system.init(2, FMOD.INITFLAGS.NORMAL, IntPtr.Zero);
+            if (ERRCHECK(result)) { return; }
+
+            result = system.getMasterSoundGroup(out masterSoundGroup);
+            if (ERRCHECK(result)) { return; }
+
+            result = masterSoundGroup.setVolume(FMODVolume);
+            if (ERRCHECK(result)) { return; }
+        }
+        
+        private bool ERRCHECK(FMOD.RESULT result)
+        {
+            if (result != FMOD.RESULT.OK)
+            {
+                FMODreset();
+                Logger.Warning($"FMOD error! {result} - {FMOD.Error.String(result)}");
+                return true;
+            }
+            return false;
+        }
+
+        private void FMODreset()
+        {
+            timer.Stop();
+            FMODprogressBar.Value = 0;
+            FMODtimerLabel.Text = "00:00.00 / 00:00.00";
+            FMODstatusLabel.Text = "Stopped";
+            FMODinfoLabel.Text = string.Empty;
+
+            if (sound.hasHandle())
+            {
+                var result = sound.release();
+                ERRCHECK(result);
+                sound.clearHandle();
+            }
+        }
+        
+        private void FMODplayButton_Click(object sender, EventArgs e)
+        {
+            if (sound.hasHandle() && channel.hasHandle())
+            {
+                _ = system.getMasterChannelGroup(out var channelGroup);
+                timer.Start();
+                var result = channel.isPlaying(out var playing);
+                if ((result != FMOD.RESULT.OK) && (result != FMOD.RESULT.ERR_INVALID_HANDLE))
+                {
+                    if (ERRCHECK(result)) { return; }
+                }
+
+                if (playing)
+                {
+                    result = channel.stop();
+                    if (ERRCHECK(result)) { return; }
+
+                    result = system.playSound(sound, channelGroup, false, out channel);
+                    if (ERRCHECK(result)) { return; }
+
+                    FMODpauseButton.Text = "Pause";
+                }
+                else
+                {
+                    result = system.playSound(sound, channelGroup, false, out channel);
+                    if (ERRCHECK(result)) { return; }
+                    FMODstatusLabel.Text = "Playing";
+
+                    if (FMODprogressBar.Value > 0)
+                    {
+                        uint newms = FMODlenms / 1000 * (uint)FMODprogressBar.Value;
+
+                        result = channel.setPosition(newms, FMOD.TIMEUNIT.MS);
+                        if ((result != FMOD.RESULT.OK) && (result != FMOD.RESULT.ERR_INVALID_HANDLE))
+                        {
+                            if (ERRCHECK(result)) { return; }
+                        }
+
+                    }
+                }
+            }
+        }
+        
+        private void FMODpauseButton_Click(object sender, EventArgs e)
+        {
+            if (sound.hasHandle() && channel.hasHandle())
+            {
+                var result = channel.isPlaying(out var playing);
+                if ((result != FMOD.RESULT.OK) && (result != FMOD.RESULT.ERR_INVALID_HANDLE))
+                {
+                    if (ERRCHECK(result)) { return; }
+                }
+
+                if (playing)
+                {
+                    result = channel.getPaused(out var paused);
+                    if (ERRCHECK(result)) { return; }
+                    result = channel.setPaused(!paused);
+                    if (ERRCHECK(result)) { return; }
+
+                    if (paused)
+                    {
+                        FMODstatusLabel.Text = "Playing";
+                        FMODpauseButton.Text = "Pause";
+                        timer.Start();
+                    }
+                    else
+                    {
+                        FMODstatusLabel.Text = "Paused";
+                        FMODpauseButton.Text = "Resume";
+                        timer.Stop();
+                    }
+                }
+            }
+        }
+
+        private void FMODstopButton_Click(object sender, EventArgs e)
+        {
+            if (channel.hasHandle())
+            {
+                var result = channel.isPlaying(out var playing);
+                if ((result != FMOD.RESULT.OK) && (result != FMOD.RESULT.ERR_INVALID_HANDLE))
+                {
+                    if (ERRCHECK(result)) { return; }
+                }
+
+                if (playing)
+                {
+                    result = channel.stop();
+                    if (ERRCHECK(result)) { return; }
+                    //channel = null;
+                    //don't FMODreset, it will nullify the sound
+                    timer.Stop();
+                    FMODprogressBar.Value = 0;
+                    FMODtimerLabel.Text = "00:00.00 / 00:00.00";
+                    FMODstatusLabel.Text = "Stopped";
+                    FMODpauseButton.Text = "Pause";
+                }
+            }
+        }
+
+        private void FMODloopButton_CheckedChanged(object sender, EventArgs e)
+        {
+            FMOD.RESULT result;
+
+            loopMode = FMODloopButton.Checked ? FMOD.MODE.LOOP_NORMAL : FMOD.MODE.LOOP_OFF;
+
+            if (sound.hasHandle())
+            {
+                result = sound.setMode(loopMode);
+                if (ERRCHECK(result)) { return; }
+            }
+
+            if (channel.hasHandle())
+            {
+                result = channel.isPlaying(out var playing);
+                if ((result != FMOD.RESULT.OK) && (result != FMOD.RESULT.ERR_INVALID_HANDLE))
+                {
+                    if (ERRCHECK(result)) { return; }
+                }
+
+                result = channel.getPaused(out var paused);
+                if ((result != FMOD.RESULT.OK) && (result != FMOD.RESULT.ERR_INVALID_HANDLE))
+                {
+                    if (ERRCHECK(result)) { return; }
+                }
+
+                if (playing || paused)
+                {
+                    result = channel.setMode(loopMode);
+                    if (ERRCHECK(result)) { return; }
+                }
+            }
+        }
+
+        private void FMODvolumeBar_ValueChanged(object sender, EventArgs e)
+        {
+            FMODVolume = Convert.ToSingle(FMODvolumeBar.Value) / 10;
+
+            var result = masterSoundGroup.setVolume(FMODVolume);
+            if (ERRCHECK(result)) { return; }
+        }
+
+        private void FMODprogressBar_Scroll(object sender, EventArgs e)
+        {
+            if (channel.hasHandle())
+            {
+                uint newms = FMODlenms / 1000 * (uint)FMODprogressBar.Value;
+                FMODtimerLabel.Text = $@"{newms / 1000 / 60:00}:{newms / 1000 % 60:00}.{newms / 10 % 100:00} / {FMODlenms / 1000 / 60:00}:{FMODlenms / 1000 % 60:00}.{FMODlenms / 10 % 100:00}";
+            }
+        }
+
+        private void FMODprogressBar_MouseDown(object sender, MouseEventArgs e)
+        {
+            timer.Stop();
+        }
+
+        private void FMODprogressBar_MouseUp(object sender, MouseEventArgs e)
+        {
+            if (channel.hasHandle())
+            {
+                uint newms = FMODlenms / 1000 * (uint)FMODprogressBar.Value;
+
+                var result = channel.setPosition(newms, FMOD.TIMEUNIT.MS);
+                if ((result != FMOD.RESULT.OK) && (result != FMOD.RESULT.ERR_INVALID_HANDLE))
+                {
+                    if (ERRCHECK(result)) { return; }
+                }
+
+
+                result = channel.isPlaying(out var playing);
+                if ((result != FMOD.RESULT.OK) && (result != FMOD.RESULT.ERR_INVALID_HANDLE))
+                {
+                    if (ERRCHECK(result)) { return; }
+                }
+
+                if (playing) { timer.Start(); }
+            }
+        }
+        
+        private void timer_Tick(object sender, EventArgs e)
+        {
+            uint ms = 0;
+            bool playing = false;
+            bool paused = false;
+
+            if (channel.hasHandle())
+            {
+                var result = channel.getPosition(out ms, FMOD.TIMEUNIT.MS);
+                if ((result != FMOD.RESULT.OK) && (result != FMOD.RESULT.ERR_INVALID_HANDLE))
+                {
+                    ERRCHECK(result);
+                }
+
+                result = channel.isPlaying(out playing);
+                if ((result != FMOD.RESULT.OK) && (result != FMOD.RESULT.ERR_INVALID_HANDLE))
+                {
+                    ERRCHECK(result);
+                }
+
+                result = channel.getPaused(out paused);
+                if ((result != FMOD.RESULT.OK) && (result != FMOD.RESULT.ERR_INVALID_HANDLE))
+                {
+                    ERRCHECK(result);
+                }
+            }
+
+            FMODtimerLabel.Text = $@"{ms / 1000 / 60:00}:{ms / 1000 % 60:00}.{ms / 10 % 100:00} / {FMODlenms / 1000 / 60:00}:{FMODlenms / 1000 % 60:00}.{FMODlenms / 10 % 100:00}";
+#if NETFRAMEWORK
+            FMODprogressBar.Value = (int)Math.Max(0, Math.Min(ms * 1000f / FMODlenms, 1000));
+#else
+            FMODprogressBar.Value = (int)Math.Clamp(ms * 1000f / FMODlenms, 0, 1000);
+#endif
+            FMODstatusLabel.Text = paused ? "Paused " : playing ? "Playing" : "Stopped";
+
+            if (system.hasHandle() && channel.hasHandle())
+            {
+                system.update();
+            }
+        }
+        
+        private void PreviewShader(AssetItem assetItem, IShader shader)
+        {
+            var sb = new StringBuilder();
+            sb.AppendLine(shader.Name);
+            var decompressedBlobSize = shader.DecompressedSize;
+            var decompressedBytes = new byte[decompressedBlobSize];
+            LZ4Codec.Decode(shader.CompressedBlob, decompressedBytes);
+            ShaderSubProgram
+            
+            string str = shader.Script;
+            PreviewText(str == null ? "Serialized Shader can't be read" : str.Replace("\n", "\r\n"));
+        }
+        
         private void PreviewText(string text)
         {
             textPreviewBox.Text = text;
@@ -1550,15 +1548,7 @@ namespace AssetStudioGUI
 
         private void ResetForm()
         {
-            if (Studio.assetsManager.assetsFileList.Count > 0)
-                Logger.Info("Resetting program...");
-
             Text = guiTitle;
-            Studio.assetsManager.Clear();
-            Studio.assemblyLoader.Clear();
-            Studio.exportableAssets.Clear();
-            Studio.visibleAssets.Clear();
-            Studio.l2dModelDict.Clear();
             sceneTreeView.Nodes.Clear();
             assetListView.VirtualListSize = 0;
             assetListView.Items.Clear();
@@ -1568,14 +1558,12 @@ namespace AssetStudioGUI
             selectedIndicesPrevList.Clear();
             previewPanel.Image = Properties.Resources.preview;
             previewPanel.SizeMode = PictureBoxSizeMode.CenterImage;
-            imageTexture?.Dispose();
-            imageTexture = null;
             assetInfoLabel.Visible = false;
             assetInfoLabel.Text = null;
             textPreviewBox.Visible = false;
             fontPreviewBox.Visible = false;
             glControl1.Visible = false;
-            lastSelectedItem = null;
+            lastSelectedItem = new AssetItem();
             sortColumn = -1;
             reverseSort = false;
             enableFiltering = false;
@@ -1592,7 +1580,6 @@ namespace AssetStudioGUI
             }
 
             taskbar.SetProgressState(TaskbarProgressBarState.NoProgress);
-            FMODreset();
         }
 
         private void tabControl2_SelectedIndexChanged(object sender, EventArgs e)
@@ -1602,10 +1589,10 @@ namespace AssetStudioGUI
                 case 0: //Preview
                     if (lastPreviewItem != lastSelectedItem)
                     {
-                        PreviewAsset(lastSelectedItem);
-                        if (displayInfo.Checked && lastSelectedItem?.InfoText != null)
+                        string info = PreviewAssetItem(lastSelectedItem);
+                        if (displayInfo.Checked && !string.IsNullOrEmpty(info))
                         {
-                            assetInfoLabel.Text = lastSelectedItem.InfoText;
+                            assetInfoLabel.Text = info;
                             assetInfoLabel.Visible = true;
                         }
                     }
@@ -1640,31 +1627,9 @@ namespace AssetStudioGUI
                     var selectedTypes = (SelectedAssetType)0;
                     foreach (var asset in selectedAssets)
                     {
-                        switch (asset.Asset)
+                        switch (asset.UnityObject)
                         {
-                            case MonoBehaviour m_MonoBehaviour:
-                                if (Studio.l2dModelDict.Count > 0 && m_MonoBehaviour.m_Script.TryGet(out var m_Script))
-                                {
-                                    if (m_Script.m_ClassName == "CubismMoc")
-                                    {
-                                        selectedTypes |= SelectedAssetType.MonoBehaviourMoc;
-                                    }
-                                    else if (m_Script.m_ClassName == "CubismFadeMotionData")
-                                    {
-                                        selectedTypes |= SelectedAssetType.MonoBehaviourFade;
-                                    }
-                                    else if (m_Script.m_ClassName == "CubismFadeMotionList")
-                                    {
-                                        selectedTypes |= SelectedAssetType.MonoBehaviourFadeLst;
-                                    }
-                                }
-                                break;
-                            case AnimationClip _:
-                                selectedTypes |= SelectedAssetType.AnimationClip;
-                                break;
-                            case Animator _:
-                                selectedTypes |= SelectedAssetType.Animator;
-                                break;
+                         
                         }
                     }
                     exportAnimatorWithSelectedAnimationClipMenuItem.Visible = (selectedTypes & SelectedAssetType.Animator) !=0 && (selectedTypes & SelectedAssetType.AnimationClip) != 0;
@@ -1699,35 +1664,12 @@ namespace AssetStudioGUI
 
         private void showOriginalFileToolStripMenuItem_Click(object sender, EventArgs e)
         {
-            var selectAsset = (AssetItem)assetListView.Items[assetListView.SelectedIndices[0]];
-            var args = $"/select, \"{selectAsset.SourceFile.originalPath ?? selectAsset.SourceFile.fullName}\"";
-            var pfi = new ProcessStartInfo("explorer.exe", args);
-            Process.Start(pfi);
+           
         }
 
         private void exportAnimatorWithAnimationClipMenuItem_Click(object sender, EventArgs e)
         {
-            AssetItem animator = null;
-            var selectedAssets = GetSelectedAssets();
-            foreach (var assetPreloadData in selectedAssets)
-            {
-                if (assetPreloadData.Type == ClassIDType.Animator)
-                {
-                    animator = assetPreloadData;
-                }
-            }
-
-            if (animator != null)
-            {
-                var saveFolderDialog = new OpenFolderDialog();
-                saveFolderDialog.InitialFolder = saveDirectoryBackup;
-                if (saveFolderDialog.ShowDialog(this) == DialogResult.OK)
-                {
-                    saveDirectoryBackup = saveFolderDialog.Folder;
-                    var exportPath = Path.Combine(saveFolderDialog.Folder, "Animator") + Path.DirectorySeparatorChar;
-                    ExportAnimatorWithAnimationClip(animator, selectedAnimationAssetsList, exportPath);
-                }
-            }
+           
         }
 
         private void exportSelectedObjectsToolStripMenuItem_Click(object sender, EventArgs e)
@@ -1742,30 +1684,7 @@ namespace AssetStudioGUI
 
         private void ExportObjects(bool animation)
         {
-            if (sceneTreeView.Nodes.Count > 0)
-            {
-                var saveFolderDialog = new OpenFolderDialog();
-                saveFolderDialog.InitialFolder = saveDirectoryBackup;
-                if (saveFolderDialog.ShowDialog(this) == DialogResult.OK)
-                {
-                    saveDirectoryBackup = saveFolderDialog.Folder;
-                    var exportPath = Path.Combine(saveFolderDialog.Folder, "GameObject") + Path.DirectorySeparatorChar;
-                    List<AssetItem> animationList = null;
-                    if (animation)
-                    {
-                        animationList = GetSelectedAssets().Where(x => x.Type == ClassIDType.AnimationClip).ToList();
-                        if (animationList.Count == 0)
-                        {
-                            animationList = null;
-                        }
-                    }
-                    ExportObjectsWithAnimationClip(exportPath, sceneTreeView.Nodes, animationList);
-                }
-            }
-            else
-            {
-                StatusStripUpdate("No Objects available for export");
-            }
+           
         }
 
         private void exportSelectedObjectsMergeToolStripMenuItem_Click(object sender, EventArgs e)
@@ -1780,48 +1699,17 @@ namespace AssetStudioGUI
 
         private void ExportMergeObjects(bool animation)
         {
-            if (sceneTreeView.Nodes.Count > 0)
-            {
-                var gameObjects = new List<GameObject>();
-                GetSelectedParentNode(sceneTreeView.Nodes, gameObjects);
-                if (gameObjects.Count > 0)
-                {
-                    var saveFileDialog = new SaveFileDialog();
-                    saveFileDialog.FileName = gameObjects[0].m_Name + " (merge).fbx";
-                    saveFileDialog.AddExtension = false;
-                    saveFileDialog.Filter = "Fbx file (*.fbx)|*.fbx";
-                    saveFileDialog.InitialDirectory = saveDirectoryBackup;
-                    if (saveFileDialog.ShowDialog(this) == DialogResult.OK)
-                    {
-                        saveDirectoryBackup = Path.GetDirectoryName(saveFileDialog.FileName);
-                        var exportPath = saveFileDialog.FileName;
-                        List<AssetItem> animationList = null;
-                        if (animation)
-                        {
-                            animationList = GetSelectedAssets().Where(x => x.Type == ClassIDType.AnimationClip).ToList();
-                            if (animationList.Count == 0)
-                            {
-                                animationList = null;
-                            }
-                        }
-                        ExportObjectsMergeWithAnimationClip(exportPath, gameObjects, animationList);
-                    }
-                }
-                else
-                {
-                    StatusStripUpdate("No Object selected for export.");
-                }
-            }
+        
         }
 
         private void goToSceneHierarchyToolStripMenuItem_Click(object sender, EventArgs e)
         {
-            var selectAsset = (AssetItem)assetListView.Items[assetListView.SelectedIndices[0]];
-            if (selectAsset.TreeNode != null)
+            var selectAsset = (AssetItem)assetListView.Items[assetListView.SelectedIndices[0]].Tag;
+            /*if (selectAsset.TreeNode != null)
             {
                 sceneTreeView.SelectedNode = selectAsset.TreeNode;
                 tabControl1.SelectedTab = tabPage1;
-            }
+            }*/
         }
 
         private void exportAllAssetsMenuItem_Click(object sender, EventArgs e)
@@ -1886,21 +1774,7 @@ namespace AssetStudioGUI
 
         private void exportAllObjectsSplitToolStripMenuItem1_Click(object sender, EventArgs e)
         {
-            if (sceneTreeView.Nodes.Count > 0)
-            {
-                var saveFolderDialog = new OpenFolderDialog();
-                saveFolderDialog.InitialFolder = saveDirectoryBackup;
-                if (saveFolderDialog.ShowDialog(this) == DialogResult.OK)
-                {
-                    saveDirectoryBackup = saveFolderDialog.Folder;
-                    var savePath = saveFolderDialog.Folder + Path.DirectorySeparatorChar;
-                    ExportSplitObjects(savePath, sceneTreeView.Nodes);
-                }
-            }
-            else
-            {
-                StatusStripUpdate("No Objects available for export");
-            }
+           
         }
 
         private void assetListView_SelectedIndexChanged(object sender, EventArgs e)
@@ -1915,34 +1789,7 @@ namespace AssetStudioGUI
 
         private void ProcessSelectedItems()
         {
-            if (assetListView.SelectedIndices.Count > 1)
-            {
-                StatusStripUpdate($"Selected {assetListView.SelectedIndices.Count} assets.");
-            }
-
-            var selectedIndicesList = assetListView.SelectedIndices.Cast<int>().ToList();
-
-            var addedIndices = selectedIndicesList.Except(selectedIndicesPrevList).ToArray();
-            foreach (var itemIndex in addedIndices)
-            {
-                selectedIndicesPrevList.Add(itemIndex);
-                var selectedItem = (AssetItem)assetListView.Items[itemIndex];
-                if (selectedItem.Type == ClassIDType.AnimationClip)
-                {
-                    selectedAnimationAssetsList.Add(selectedItem);
-                }
-            }
-
-            var removedIndices = selectedIndicesPrevList.Except(selectedIndicesList).ToArray();
-            foreach (var itemIndex in removedIndices)
-            {
-                selectedIndicesPrevList.Remove(itemIndex);
-                var unselectedItem = (AssetItem)assetListView.Items[itemIndex];
-                if (unselectedItem.Type == ClassIDType.AnimationClip)
-                {
-                    selectedAnimationAssetsList.Remove(unselectedItem);
-                }
-            }
+           
         }
 
         private List<AssetItem> GetSelectedAssets()
@@ -1950,7 +1797,7 @@ namespace AssetStudioGUI
             var selectedAssets = new List<AssetItem>(assetListView.SelectedIndices.Count);
             foreach (int index in assetListView.SelectedIndices)
             {
-                selectedAssets.Add((AssetItem)assetListView.Items[index]);
+                selectedAssets.Add((AssetItem)assetListView.Items[index].Tag);
             }
 
             return selectedAssets;
@@ -1958,166 +1805,19 @@ namespace AssetStudioGUI
 
         private void FilterAssetList()
         {
-            if (exportableAssets.Count < 1)
-                return;
-
             assetListView.BeginUpdate();
-            assetListView.SelectedIndices.Clear();
-            var show = new List<ClassIDType>();
-            var filterMoc = false;
-            if (!allToolStripMenuItem.Checked)
-            {
-                for (var i = 1; i < filterTypeToolStripMenuItem.DropDownItems.Count; i++)
-                {
-                    var item = (ToolStripMenuItem)filterTypeToolStripMenuItem.DropDownItems[i];
-                    if (item.Checked)
-                    {
-                        if (item.Name == "MonoBehaviour (Live2D Model)")
-                            filterMoc = true;
-                        else
-                            show.Add((ClassIDType)Enum.Parse(typeof(ClassIDType), item.Text));
-                    }
-                }
-                visibleAssets = filterMoc
-                    ? exportableAssets.FindAll(x => (x.Asset is MonoBehaviour monoBehaviour && l2dModelDict.ContainsKey(monoBehaviour)) || show.Contains(x.Type))
-                    : exportableAssets.FindAll(x => show.Contains(x.Type));
-            }
-            else
-            {
-                visibleAssets = exportableAssets;
-            }
-            if (listSearch.Text != " Filter ")
-            {
-                var mode = (ListSearchFilterMode)listSearchFilterMode.SelectedIndex;
-                switch (mode)
-                {
-                    case ListSearchFilterMode.Include:
-                        visibleAssets = visibleAssets.FindAll(x =>
-                            x.Text.IndexOf(listSearch.Text, StringComparison.OrdinalIgnoreCase) >= 0
-                            || x.SubItems[1].Text.IndexOf(listSearch.Text, StringComparison.OrdinalIgnoreCase) >= 0
-                            || x.SubItems[3].Text.IndexOf(listSearch.Text, StringComparison.OrdinalIgnoreCase) >= 0);
-                        listSearch.ForeColor = SystemColors.WindowText;
-                        break;
-                    case ListSearchFilterMode.Exclude:
-                        visibleAssets = visibleAssets.FindAll(x =>
-                            x.Text.IndexOf(listSearch.Text, StringComparison.OrdinalIgnoreCase) <= 0
-                            && x.SubItems[1].Text.IndexOf(listSearch.Text, StringComparison.OrdinalIgnoreCase) <= 0
-                            && x.SubItems[3].Text.IndexOf(listSearch.Text, StringComparison.OrdinalIgnoreCase) <= 0);
-                        listSearch.ForeColor = SystemColors.WindowText;
-                        break;
-                    case ListSearchFilterMode.RegexName:
-                    case ListSearchFilterMode.RegexContainer:
-                        StatusStripUpdate("");
-                        var pattern = listSearch.Text;
-                        var regexOptions = RegexOptions.IgnoreCase | RegexOptions.Singleline;
-                        try
-                        {
-                            if (mode == ListSearchFilterMode.RegexName)
-                            {
-                                visibleAssets = visibleAssets.FindAll(x => Regex.IsMatch(x.Text, pattern, regexOptions));
-                            }
-                            else
-                            {
-                                visibleAssets = visibleAssets.FindAll(x => Regex.IsMatch(x.SubItems[1].Text, pattern, regexOptions));
-                            }
-                            listSearch.BackColor = SystemInformation.HighContrast ? listSearch.BackColor : System.Drawing.Color.PaleGreen;
-                            listSearch.ForeColor = isDarkMode ? System.Drawing.Color.Black : listSearch.ForeColor;
-                        }
-                        catch (ArgumentException e)
-                        {
-                            listSearch.BackColor = SystemInformation.HighContrast ? listSearch.BackColor : System.Drawing.Color.FromArgb(255, 160, 160);
-                            listSearch.ForeColor = isDarkMode ? System.Drawing.Color.Black : listSearch.ForeColor;
-                            StatusStripUpdate($"Regex error: {e.Message}");
-                        }
-                        catch (RegexMatchTimeoutException)
-                        {
-                            listSearch.BackColor = SystemInformation.HighContrast ? listSearch.BackColor : System.Drawing.Color.FromArgb(255, 160, 160);
-                            listSearch.ForeColor = isDarkMode ? System.Drawing.Color.Black : listSearch.ForeColor;
-                            StatusStripUpdate($"Timeout error");
-                        }
-                        break;
-                }
-            }
-            assetListView.VirtualListSize = visibleAssets.Count;
+            
             assetListView.EndUpdate();
         }
 
         private void ExportAssets(ExportFilter type, ExportType exportType)
         {
-            if (exportableAssets.Count > 0)
-            {
-                var saveFolderDialog = new OpenFolderDialog();
-                saveFolderDialog.InitialFolder = saveDirectoryBackup;
-                if (saveFolderDialog.ShowDialog(this) == DialogResult.OK)
-                {
-                    timer.Stop();
-                    saveDirectoryBackup = saveFolderDialog.Folder;
-                    List<AssetItem> toExportAssets = null;
-                    switch (type)
-                    {
-                        case ExportFilter.All:
-                            toExportAssets = exportableAssets;
-                            break;
-                        case ExportFilter.Selected:
-                            toExportAssets = GetSelectedAssets();
-                            break;
-                        case ExportFilter.Filtered:
-                            toExportAssets = visibleAssets;
-                            break;
-                    }
-
-                    if (toExportAssets != null && filterTypeToolStripMenuItem.DropDownItems.ContainsKey("Texture2DArray"))
-                    {
-                        var tex2dArrayImgPathIdSet = toExportAssets.FindAll(x => x.Type == ClassIDType.Texture2DArrayImage).Select(x => x.m_PathID).ToHashSet();
-                        foreach (var pathId in tex2dArrayImgPathIdSet)
-                        {
-                            toExportAssets = toExportAssets.Where(x => 
-                                x.Type != ClassIDType.Texture2DArray 
-                                || (x.Type == ClassIDType.Texture2DArray && x.m_PathID != pathId))
-                                .ToList();
-                        }
-                    }
-                    Studio.ExportAssets(saveFolderDialog.Folder, toExportAssets, exportType);
-                }
-            }
-            else
-            {
-                StatusStripUpdate("No exportable assets loaded");
-            }
+          
         }
 
         private void ExportAssetsList(ExportFilter type)
         {
-            // XXX: Only exporting as XML for now, but would JSON(/CSV/other) be useful too?
-
-            if (exportableAssets.Count > 0)
-            {
-                var saveFolderDialog = new OpenFolderDialog();
-                saveFolderDialog.InitialFolder = saveDirectoryBackup;
-                if (saveFolderDialog.ShowDialog(this) == DialogResult.OK)
-                {
-                    timer.Stop();
-                    saveDirectoryBackup = saveFolderDialog.Folder;
-                    List<AssetItem> toExportAssets = null;
-                    switch (type)
-                    {
-                        case ExportFilter.All:
-                            toExportAssets = exportableAssets;
-                            break;
-                        case ExportFilter.Selected:
-                            toExportAssets = GetSelectedAssets();
-                            break;
-                        case ExportFilter.Filtered:
-                            toExportAssets = visibleAssets;
-                            break;
-                    }
-                    Studio.ExportAssetsList(saveFolderDialog.Folder, toExportAssets, ExportListType.XML);
-                }
-            }
-            else
-            {
-                StatusStripUpdate("No exportable assets loaded");
-            }
+           
         }
 
         private void toolStripMenuItem15_Click(object sender, EventArgs e)
@@ -2216,61 +1916,17 @@ namespace AssetStudioGUI
 
         private void selectAllRelatedAssets(object sender, EventArgs e)
         {
-            var selectedNode = sceneTreeView.SelectedNode;
-            var relatedAssets = visibleAssets.FindAll(x => x.TreeNode == selectedNode);
-            if (relatedAssets.Count > 0)
-            {
-                assetListView.SelectedIndices.Clear();
-                tabControl1.SelectedTab = tabPage2;
-                foreach (var asset in relatedAssets)
-                {
-                    var assetItem = assetListView.Items[assetListView.Items.IndexOf(asset)];
-                    assetItem.Selected = true;
-                }
-                assetListView.Items[assetListView.Items.IndexOf(relatedAssets[0])].EnsureVisible();
-            }
+          
         }
 
         private void showRelatedAssetsToolStripMenuItem_Click(object sender, EventArgs e)
         {
-            var selectedNode = sceneTreeView.SelectedNode;
-            var relatedAssets = visibleAssets.FindAll(x => x.TreeNode == selectedNode);
-            if (relatedAssets.Count == 0)
-            {
-                StatusStripUpdate("No related assets were found among the visible assets.");
-            }
+           
         }
 
         private void contextMenuStrip2_Opening(object sender, System.ComponentModel.CancelEventArgs e)
         {
-            var selectedNode = sceneTreeView.SelectedNode;
-            var relatedAssets = visibleAssets.FindAll(x => x.TreeNode == selectedNode);
-            shShowRelatedAssetsToolStripMenuItem.DropDownItems.Clear();
-            if (relatedAssets.Count > 1)
-            {
-                var assetItem = new ToolStripMenuItem
-                {
-                    CheckOnClick = false,
-                    Name = "selectAllRelatedAssetsToolStripMenuItem",
-                    Size = new Size(180, 22),
-                    Text = "Select all"
-                };
-                assetItem.Click += selectAllRelatedAssets;
-                shShowRelatedAssetsToolStripMenuItem.DropDownItems.Add(assetItem);
-            }
-            foreach (var asset in relatedAssets)
-            {
-                var index = assetListView.Items.IndexOf(asset);
-                var assetItem = new ToolStripMenuItem
-                {
-                    CheckOnClick = false,
-                    Name = $"{index}_{asset.TypeString}",
-                    Size = new Size(180, 22),
-                    Text = $"({asset.TypeString}) {asset.Text}"
-                };
-                assetItem.Click += selectRelatedAsset;
-                shShowRelatedAssetsToolStripMenuItem.DropDownItems.Add(assetItem);
-            }
+          
         }
 
         private void showConsoleToolStripMenuItem_Click(object sender, EventArgs e)
@@ -2307,19 +1963,7 @@ namespace AssetStudioGUI
 
         private void exportAllL2D_Click(object sender, EventArgs e)
         {
-            if (exportableAssets.Count > 0)
-            {
-                if (Studio.l2dModelDict.Count == 0)
-                {
-                    Logger.Info("Live2D Cubism models were not found.");
-                    return;
-                }
-                Live2DExporter();
-            }
-            else
-            {
-                Logger.Info("No exportable assets loaded");
-            }
+           
         }
 
         private void exportSelectedL2D_Click(object sender, EventArgs e)
@@ -2344,151 +1988,24 @@ namespace AssetStudioGUI
 
         private void ExportSelectedL2DModels(ExportL2DFilter l2dExportMode)
         {
-            if (Studio.exportableAssets.Count == 0)
-            {
-                Logger.Info("No exportable assets loaded");
-                return;
-            }
-            if (Studio.l2dModelDict.Count == 0)
-            {
-                Logger.Info("Live2D Cubism models were not found.");
-                return;
-            }
-            var selectedAssets = GetSelectedAssets();
-            if (selectedAssets.Count == 0)
-                return;
+            
 
-            MonoBehaviour selectedFadeLst = null;
-            var selectedMocs = new List<MonoBehaviour>();
-            var selectedFadeMotions = new List<MonoBehaviour>();
-            var selectedClips = new List<AnimationClip>();
-            foreach (var assetItem in selectedAssets)
-            {
-                if (assetItem.Asset is MonoBehaviour m_MonoBehaviour && m_MonoBehaviour.m_Script.TryGet(out var m_Script))
-                {
-                    if (m_Script.m_ClassName == "CubismMoc")
-                    {
-                        selectedMocs.Add(m_MonoBehaviour);
-                    }
-                    else if (m_Script.m_ClassName == "CubismFadeMotionData")
-                    {
-                        selectedFadeMotions.Add(m_MonoBehaviour);
-                    }
-                    else if (m_Script.m_ClassName == "CubismFadeMotionList")
-                    {
-                        selectedFadeLst = m_MonoBehaviour;
-                    }
-                }
-                else if (assetItem.Asset is AnimationClip m_AnimationClip)
-                {
-                    selectedClips.Add(m_AnimationClip);
-                }
-            }
-            if (selectedMocs.Count == 0)
-            {
-                Logger.Info("Live2D Cubism models were not selected.");
-                return;
-            }
-
-            switch (l2dExportMode)
-            {
-                case ExportL2DFilter.Selected:
-                    Live2DExporter(selectedMocs);
-                    break;
-                case ExportL2DFilter.SelectedWithFadeList:
-                    if (selectedFadeLst == null)
-                    {
-                        Logger.Info("Fade Motion List was not selected.");
-                        return;
-                    }
-                    Live2DExporter(selectedMocs, selFadeLst: selectedFadeLst);
-                    break;
-                case ExportL2DFilter.SelectedWithFade:
-                    if (selectedFadeMotions.Count == 0)
-                    {
-                        Logger.Info("No Fade motions were selected.");
-                        return;
-                    }
-                    Live2DExporter(selectedMocs, selFadeMotions: selectedFadeMotions);
-                    break;
-                case ExportL2DFilter.SelectedWithClips:
-                    if (selectedClips.Count == 0)
-                    {
-                        Logger.Info("No AnimationClips were selected.");
-                        return;
-                    }
-                    Live2DExporter(selectedMocs, selectedClips);
-                    break;
-            }
         }
 
-        private void Live2DExporter(List<MonoBehaviour> selMocs = null, List<AnimationClip> selClipMotions = null, List<MonoBehaviour> selFadeMotions = null, MonoBehaviour selFadeLst = null)
-        {
-            var saveFolderDialog = new OpenFolderDialog();
-            saveFolderDialog.InitialFolder = saveDirectoryBackup;
-            if (saveFolderDialog.ShowDialog(this) == DialogResult.OK)
-            {
-                timer.Stop();
-                saveDirectoryBackup = saveFolderDialog.Folder;
-                Progress.Reset();
-                BeginInvoke(new Action(() => { progressBar1.Style = ProgressBarStyle.Marquee; }));
-
-                Studio.ExportLive2D(saveFolderDialog.Folder, selMocs, selClipMotions, selFadeMotions, selFadeLst);
-            }
-        }
 
         private void customBlockCompressionComboBoxToolStripMenuItem_SelectedIndexChanged(object sender, EventArgs e)
         {
-            var selectedTypeIndex = customBlockCompressionComboBoxToolStripMenuItem.SelectedIndex;
-            switch (selectedTypeIndex)
-            {
-                case 0:
-                    assetsManager.CustomBlockCompression = CompressionType.Auto;
-                    break;
-                case 1:
-                    assetsManager.CustomBlockCompression = CompressionType.Zstd;
-                    break;
-                case 2:
-                    assetsManager.CustomBlockCompression = CompressionType.Oodle;
-                    break;
-                case 3:
-                    assetsManager.CustomBlockCompression = CompressionType.Lz4HC;
-                    break;
-                case 4:
-                    assetsManager.CustomBlockCompression = CompressionType.Lzma;
-                    break;
-            }
+          
         }
 
         private void customBlockInfoCompressionComboBoxToolStripMenuItem_SelectedIndexChanged(object sender, EventArgs e)
         {
-            var selectedTypeIndex = customBlockInfoCompressionComboBoxToolStripMenuItem.SelectedIndex;
-            switch (selectedTypeIndex)
-            {
-                case 0:
-                    assetsManager.CustomBlockInfoCompression = CompressionType.Auto;
-                    break;
-                case 1:
-                    assetsManager.CustomBlockInfoCompression = CompressionType.Zstd;
-                    break;
-                case 2:
-                    assetsManager.CustomBlockInfoCompression = CompressionType.Oodle;
-                    break;
-                case 3:
-                    assetsManager.CustomBlockInfoCompression = CompressionType.Lz4HC;
-                    break;
-                case 4:
-                    assetsManager.CustomBlockInfoCompression = CompressionType.Lzma;
-                    break;
-            }
+           
         }
 
         private void useAssetLoadingViaTypetreeToolStripMenuItem_CheckedChanged(object sender, EventArgs e)
         {
-            var isEnabled = useAssetLoadingViaTypetreeToolStripMenuItem.Checked;
-            assetsManager.LoadingViaTypeTreeEnabled = isEnabled;
-            Properties.Settings.Default.useTypetreeLoading = isEnabled;
-            Properties.Settings.Default.Save();
+           
         }
 
         private void ApplyColorTheme(out bool isDarkMode)
@@ -2637,304 +2154,6 @@ namespace AssetStudioGUI
             Properties.Settings.Default.autoplayAudio = autoPlayAudioAssetsToolStripMenuItem.Checked;
             Properties.Settings.Default.Save();
         }
-
-        private void FBXinitOptions()
-        {
-            Properties.Settings.Default.fbxSettings = new Fbx.Settings().ToBase64();
-            Properties.Settings.Default.Save();
-        }
-
-        #region FMOD
-        private void FMODinit()
-        {
-            FMODreset();
-
-            var result = FMOD.Factory.System_Create(out system);
-            if (ERRCHECK(result)) { return; }
-
-            result = system.getVersion(out var version);
-            ERRCHECK(result);
-            if (version < FMOD.VERSION.number)
-            {
-                Logger.Error($"Error! You are using an old version of FMOD {version:X}. This program requires {FMOD.VERSION.number:X}.");
-                Application.Exit();
-            }
-
-            result = system.init(2, FMOD.INITFLAGS.NORMAL, IntPtr.Zero);
-            if (ERRCHECK(result)) { return; }
-
-            _ = system.getMasterChannelGroup(out var channelGroup);
-            result = channelGroup.setVolume(FMODVolume);
-            if (ERRCHECK(result)) { return; }
-        }
-
-        private void FMODreset()
-        {
-            timer.Stop();
-            FMODprogressBar.Value = 0;
-            FMODtimerLabel.Text = "00:00.00 / 00:00.00";
-            FMODstatusLabel.Text = "Stopped";
-            FMODpauseButton.Text = "Pause";
-            FMODinfoLabel.Text = "";
-            FMODaudioChannelsLabel.Text = "";
-
-            if (sound.hasHandle())
-            {
-                FMOD.RESULT result;
-                sound.getSubSoundParent(out var parentsound);
-                result = sound.release();
-                ERRCHECK(result);
-                sound.clearHandle();
-                if (parentsound.hasHandle())
-                {
-                    result = parentsound.release();
-                    ERRCHECK(result);
-                    parentsound.clearHandle();
-                }
-            }
-            if (soundBuff != null)
-            {
-                BigArrayPool<byte>.Shared.Return(soundBuff, clearArray: true);
-                soundBuff = null;
-            }
-        }
-
-        private void FMODplayButton_Click(object sender, EventArgs e)
-        {
-            if (sound.hasHandle() && channel.hasHandle())
-            {
-                _ = system.getMasterChannelGroup(out var channelGroup);
-                timer.Start();
-                var result = channel.isPlaying(out var playing);
-                if ((result != FMOD.RESULT.OK) && (result != FMOD.RESULT.ERR_INVALID_HANDLE))
-                {
-                    if (ERRCHECK(result)) { return; }
-                }
-
-                if (playing)
-                {
-                    result = channel.stop();
-                    if (ERRCHECK(result)) { return; }
-
-                    result = system.playSound(sound, channelGroup, false, out channel);
-                    if (ERRCHECK(result)) { return; }
-
-                    FMODpauseButton.Text = "Pause";
-                }
-                else
-                {
-                    result = system.playSound(sound, channelGroup, false, out channel);
-                    if (ERRCHECK(result)) { return; }
-                    FMODstatusLabel.Text = "Playing";
-
-                    if (FMODprogressBar.Value > 0)
-                    {
-                        uint newms = FMODlenms / 1000 * (uint)FMODprogressBar.Value;
-
-                        result = channel.setPosition(newms, FMOD.TIMEUNIT.MS);
-                        if ((result != FMOD.RESULT.OK) && (result != FMOD.RESULT.ERR_INVALID_HANDLE))
-                        {
-                            if (ERRCHECK(result)) { return; }
-                        }
-                    }
-                }
-            }
-        }
-
-        private void FMODpauseButton_Click(object sender, EventArgs e)
-        {
-            if (sound.hasHandle() && channel.hasHandle())
-            {
-                var result = channel.isPlaying(out var playing);
-                if ((result != FMOD.RESULT.OK) && (result != FMOD.RESULT.ERR_INVALID_HANDLE))
-                {
-                    if (ERRCHECK(result)) { return; }
-                }
-
-                if (playing)
-                {
-                    result = channel.getPaused(out var paused);
-                    if (ERRCHECK(result)) { return; }
-                    result = channel.setPaused(!paused);
-                    if (ERRCHECK(result)) { return; }
-
-                    if (paused)
-                    {
-                        FMODstatusLabel.Text = "Playing";
-                        FMODpauseButton.Text = "Pause";
-                        timer.Start();
-                    }
-                    else
-                    {
-                        FMODstatusLabel.Text = "Paused";
-                        FMODpauseButton.Text = "Resume";
-                        timer.Stop();
-                    }
-                }
-            }
-        }
-
-        private void FMODstopButton_Click(object sender, EventArgs e)
-        {
-            if (channel.hasHandle())
-            {
-                var result = channel.isPlaying(out var playing);
-                if ((result != FMOD.RESULT.OK) && (result != FMOD.RESULT.ERR_INVALID_HANDLE))
-                {
-                    if (ERRCHECK(result)) { return; }
-                }
-
-                if (playing)
-                {
-                    result = channel.stop();
-                    if (ERRCHECK(result)) { return; }
-                    //channel = null;
-                    //don't FMODreset, it will nullify the sound
-                    timer.Stop();
-                    FMODprogressBar.Value = 0;
-                    FMODtimerLabel.Text = "00:00.00 / 00:00.00";
-                    FMODstatusLabel.Text = "Stopped";
-                    FMODpauseButton.Text = "Pause";
-                }
-            }
-        }
-
-        private void FMODloopButton_CheckedChanged(object sender, EventArgs e)
-        {
-            FMOD.RESULT result;
-
-            loopMode = FMODloopButton.Checked ? FMOD.MODE.LOOP_NORMAL : FMOD.MODE.LOOP_OFF;
-
-            if (sound.hasHandle())
-            {
-                result = sound.setMode(loopMode);
-                if (ERRCHECK(result)) { return; }
-            }
-
-            if (channel.hasHandle())
-            {
-                result = channel.isPlaying(out var playing);
-                if ((result != FMOD.RESULT.OK) && (result != FMOD.RESULT.ERR_INVALID_HANDLE))
-                {
-                    if (ERRCHECK(result)) { return; }
-                }
-
-                result = channel.getPaused(out var paused);
-                if ((result != FMOD.RESULT.OK) && (result != FMOD.RESULT.ERR_INVALID_HANDLE))
-                {
-                    if (ERRCHECK(result)) { return; }
-                }
-
-                if (playing || paused)
-                {
-                    result = channel.setMode(loopMode);
-                    if ((result != FMOD.RESULT.OK) && (result != FMOD.RESULT.ERR_INVALID_HANDLE))
-                    {
-                        if (ERRCHECK(result)) { return; }
-                    }
-                }
-            }
-        }
-
-        private void FMODvolumeBar_ValueChanged(object sender, EventArgs e)
-        {
-            FMODVolume = FMODvolumeBar.Value / 10f;
-
-            _ = system.getMasterChannelGroup(out var channelGroup);
-            var result = channelGroup.setVolume(FMODVolume);
-            if (ERRCHECK(result)) { return; }
-        }
-
-        private void FMODprogressBar_Scroll(object sender, EventArgs e)
-        {
-            if (channel.hasHandle())
-            {
-                uint newms = FMODlenms / 1000 * (uint)FMODprogressBar.Value;
-                FMODtimerLabel.Text = $"{newms / 1000 / 60:00}:{newms / 1000 % 60:00}.{newms / 10 % 100:00} / {FMODlenms / 1000 / 60:00}:{FMODlenms / 1000 % 60:00}.{FMODlenms / 10 % 100:00}";
-            }
-        }
-
-        private void FMODprogressBar_MouseDown(object sender, MouseEventArgs e)
-        {
-            timer.Stop();
-        }
-
-        private void FMODprogressBar_MouseUp(object sender, MouseEventArgs e)
-        {
-            if (channel.hasHandle())
-            {
-                uint newms = FMODlenms / 1000 * (uint)FMODprogressBar.Value;
-
-                var result = channel.setPosition(newms, FMOD.TIMEUNIT.MS);
-                if ((result != FMOD.RESULT.OK) && (result != FMOD.RESULT.ERR_INVALID_HANDLE))
-                {
-                    if (ERRCHECK(result)) { return; }
-                }
-
-                result = channel.isPlaying(out var playing);
-                if ((result != FMOD.RESULT.OK) && (result != FMOD.RESULT.ERR_INVALID_HANDLE))
-                {
-                    if (ERRCHECK(result)) { return; }
-                }
-
-                if (playing) { timer.Start(); }
-            }
-        }
-
-        private void timer_Tick(object sender, EventArgs e)
-        {
-            uint ms = 0;
-            bool playing = false;
-            bool paused = false;
-
-            if (channel.hasHandle())
-            {
-                var result = channel.getPosition(out ms, FMOD.TIMEUNIT.MS);
-                if ((result != FMOD.RESULT.OK) && (result != FMOD.RESULT.ERR_INVALID_HANDLE))
-                {
-                    ERRCHECK(result);
-                }
-
-                result = channel.isPlaying(out playing);
-                if ((result != FMOD.RESULT.OK) && (result != FMOD.RESULT.ERR_INVALID_HANDLE))
-                {
-                    ERRCHECK(result);
-                }
-
-                result = channel.getPaused(out paused);
-                if ((result != FMOD.RESULT.OK) && (result != FMOD.RESULT.ERR_INVALID_HANDLE))
-                {
-                    ERRCHECK(result);
-                }
-
-                if (!playing)
-                {
-                    timer.Stop();
-                    ms = 0;
-                }
-            }
-
-            FMODtimerLabel.Text = $"{ms / 1000 / 60:00}:{ms / 1000 % 60:00}.{ms / 10 % 100:00} / {FMODlenms / 1000 / 60:00}:{FMODlenms / 1000 % 60:00}.{FMODlenms / 10 % 100:00}";
-            FMODprogressBar.Value = (int)AssetStudio.MathHelper.Clamp(ms * 1000f / FMODlenms, 0, 1000);
-            FMODstatusLabel.Text = paused ? "Paused " : playing ? "Playing" : "Stopped";
-
-            if (system.hasHandle() && channel.hasHandle())
-            {
-                system.update();
-            }
-        }
-
-        private bool ERRCHECK(FMOD.RESULT result)
-        {
-            if (result != FMOD.RESULT.OK)
-            {
-                FMODreset();
-                Logger.Warning($"FMOD error! {result} - {FMOD.Error.String(result)}");
-                return true;
-            }
-            return false;
-        }
-        #endregion
 
         #region GLControl
         private void InitOpenTK()

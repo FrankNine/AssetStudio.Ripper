@@ -10,9 +10,6 @@ using System;
 using System.Text;
 using System.Runtime.InteropServices;
 using System.Collections.Generic;
-#if NETFRAMEWORK
-using AssetStudio.PInvoke;
-#endif
 
 namespace FMOD
 {
@@ -22,8 +19,10 @@ namespace FMOD
     */
     public partial class VERSION
     {
-        public const int    number = 0x00020306;
+        public const int    number = 0x00020308;
+#if !UNITY_2021_3_OR_NEWER
         public const string dll    = "fmod";
+#endif
     }
 
     public class CONSTANTS
@@ -964,14 +963,8 @@ namespace FMOD
     /*
         FMOD System factory functions.  Use this to create an FMOD System Instance.  below you will see System init/close to get started.
     */
-        public struct Factory
+    public struct Factory
     {
-#if NETFRAMEWORK
-        static Factory()
-        {
-            DllLoader.PreloadDll(VERSION.dll);
-        }
-#endif
         public static RESULT System_Create(out System system)
         {
             return FMOD5_System_Create(out system.handle, VERSION.number);
@@ -3363,7 +3356,7 @@ namespace FMOD
         }
         public RESULT setParameterData(int index, byte[] data)
         {
-            return FMOD5_DSP_SetParameterData(this.handle, index, Marshal.UnsafeAddrOfPinnedArrayElement(data, 0), (uint)data.Length);
+            return FMOD5_DSP_SetParameterData(this.handle, index, data, data == null ? 0 : (uint)data.Length);
         }
         public RESULT getParameterFloat(int index, out float value)
         {
@@ -3515,7 +3508,7 @@ namespace FMOD
         [DllImport(VERSION.dll)]
         private static extern RESULT FMOD5_DSP_SetParameterBool          (IntPtr dsp, int index, bool value);
         [DllImport(VERSION.dll)]
-        private static extern RESULT FMOD5_DSP_SetParameterData          (IntPtr dsp, int index, IntPtr data, uint length);
+        private static extern RESULT FMOD5_DSP_SetParameterData          (IntPtr dsp, int index, byte[] data, uint length);
         [DllImport(VERSION.dll)]
         private static extern RESULT FMOD5_DSP_GetParameterFloat         (IntPtr dsp, int index, out float value, IntPtr valuestr, int valuestrlen);
         [DllImport(VERSION.dll)]
