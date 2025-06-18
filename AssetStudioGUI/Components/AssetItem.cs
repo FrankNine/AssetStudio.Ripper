@@ -1,40 +1,26 @@
-﻿using System.Windows.Forms;
-using AssetStudio;
+﻿using System.Collections.Generic;
+using AssetRipper.SourceGenerated.Enums;
 
-namespace AssetStudioGUI
+namespace AssetStudioGUI;
+
+using AssetRipper.Assets;
+
+internal record struct AssetItem
+(
+    IUnityObjectBase UnityObject,
+    string Name,
+    string TypeString,
+    TextureFormat TextureFormat,
+    long UniqueID,
+    long PathID,
+    ulong FullSize,
+    ulong CompressedSizeEstimate
+);
+
+internal class SceneTreeNode
 {
-    internal class AssetItem : ListViewItem
-    {
-        public Object Asset;
-        public SerializedFile SourceFile;
-        public string Container = string.Empty;
-        public string TypeString;
-        public long m_PathID;
-        public long FullSize;
-        public ClassIDType Type;
-        public string InfoText;
-        public string UniqueID;
-        public GameObjectTreeNode TreeNode;
-
-        public AssetItem(Object asset)
-        {
-            Asset = asset;
-            SourceFile = asset.assetsFile;
-            Type = asset.type;
-            TypeString = Type.ToString();
-            m_PathID = asset.m_PathID;
-            FullSize = asset.byteSize;
-        }
-
-        public void SetSubItems()
-        {
-            SubItems.AddRange(new[]
-            {
-                Container, //Container
-                TypeString, //Type
-                m_PathID.ToString(), //PathID
-                FullSize.ToString(), //Size
-            });
-        }
-    }
+    public string Name;
+    public int IndexInAssetCollection;
+    public SceneTreeNode Parent;
+    public List<SceneTreeNode> Children;
 }

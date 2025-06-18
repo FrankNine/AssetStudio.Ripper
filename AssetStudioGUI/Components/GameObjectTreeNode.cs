@@ -1,16 +1,16 @@
-﻿using System.Windows.Forms;
-using AssetStudio;
+﻿namespace AssetStudioGUI;
 
-namespace AssetStudioGUI
+using System.Windows.Forms;
+
+using AssetRipper.SourceGenerated.Classes.ClassID_1;
+
+internal class GameObjectTreeNode : TreeNode
 {
-    internal class GameObjectTreeNode : TreeNode
-    {
-        public GameObject gameObject;
+    public IGameObject gameObject;
 
-        public GameObjectTreeNode(GameObject gameObject)
-        {
-            this.gameObject = gameObject;
-            Text = gameObject.m_Name;
-        }
+    public GameObjectTreeNode(IGameObject gameObject)
+    {
+        this.gameObject = gameObject;
+        Text = gameObject.Name;
     }
 }

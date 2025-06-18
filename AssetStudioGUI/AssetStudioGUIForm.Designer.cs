@@ -157,7 +157,6 @@
             this.shExpandAllToolStripMenuItem = new System.Windows.Forms.ToolStripMenuItem();
             this.shCollapseAllToolStripMenuItem = new System.Windows.Forms.ToolStripMenuItem();
             this.timer = new System.Windows.Forms.Timer(this.components);
-            this.openFileDialog1 = new System.Windows.Forms.OpenFileDialog();
             this.contextMenuStrip1 = new System.Windows.Forms.ContextMenuStrip(this.components);
             this.copyToolStripMenuItem = new System.Windows.Forms.ToolStripMenuItem();
             this.exportSelectedAssetsToolStripMenuItem = new System.Windows.Forms.ToolStripMenuItem();
@@ -423,7 +422,6 @@
             this.toolStripMenuItem14.Name = "toolStripMenuItem14";
             this.toolStripMenuItem14.Size = new System.Drawing.Size(241, 22);
             this.toolStripMenuItem14.Text = "Specify Unity version";
-            this.toolStripMenuItem14.DropDownClosed += new System.EventHandler(this.specifyUnityVersion_Close);
             // 
             // specifyUnityVersion
             // 
@@ -432,6 +430,7 @@
             this.specifyUnityVersion.Name = "specifyUnityVersion";
             this.specifyUnityVersion.Size = new System.Drawing.Size(100, 23);
             this.specifyUnityVersion.ToolTipText = "Specify full Unity version, including letters at the end\r\nExample: 2017.4.39f1";
+            this.specifyUnityVersion.Text = "2023.1.1f1";
             // 
             // showExpOpt
             // 
@@ -1476,13 +1475,6 @@
             this.timer.Interval = 10;
             this.timer.Tick += new System.EventHandler(this.timer_Tick);
             // 
-            // openFileDialog1
-            // 
-            this.openFileDialog1.AddExtension = false;
-            this.openFileDialog1.Filter = "All types|*.*";
-            this.openFileDialog1.Multiselect = true;
-            this.openFileDialog1.RestoreDirectory = true;
-            // 
             // contextMenuStrip1
             // 
             this.contextMenuStrip1.ImageScalingSize = new System.Drawing.Size(20, 20);
@@ -1710,7 +1702,6 @@
         private System.Windows.Forms.ToolStripSeparator toolStripMenuItem1;
         private System.Windows.Forms.ToolStripMenuItem extractFileToolStripMenuItem;
         private System.Windows.Forms.ToolStripMenuItem extractFolderToolStripMenuItem;
-        private System.Windows.Forms.OpenFileDialog openFileDialog1;
         private System.Windows.Forms.ToolStripMenuItem showExpOpt;
         private GOHierarchy sceneTreeView;
         private System.Windows.Forms.ToolStripMenuItem debugMenuItem;
